@@ -1,0 +1,94 @@
+{
+  "bot_id": "germany40_5m_vwap",
+  "poll_seconds": 30,
+  "http_timeout": 30,
+  "account": {
+    "account_id": "${CAPITAL_ACCOUNT_ID}"
+  },
+  "market": {
+    "epic": "DE40",
+    "resolution": "MINUTE_5",
+    "warmup_bars": 600
+  },
+  "schedule": {
+    "timezone": "Europe/Berlin",
+    "rth_start": "00:00",
+    "rth_end": "23:59",
+    "rth_enabled": true,
+    "disable_thursday_utc": false,
+    "no_trade_hours_berlin": []
+  },
+  "strategy": {
+    "module": "capbot.strategies.de40_vwap_k020:DE40VWAPK020",
+    "params": {
+      "VOL_WINDOW": 20,
+      "BODY_MIN": 0.7,
+      "VOL_REL_MIN": 0.7,
+      "RSI_LEN": 14,
+      "RSI_LONG_MAX": 75,
+      "RSI_SHORT_MIN": 40,
+      "ATR_LEN": 14,
+      "SL_ATR": 1.0,
+      "TP_R_MULTIPLE": 3.0,
+      "BEAR_PREV3_LONG": 2,
+      "BULL_PREV3_SHORT": 2,
+      "VWAP_TZ": "Europe/Berlin",
+      "VWAP_DISTANCE_K": 0.2
+    },
+    "name": "de40_vwap_k020",
+    "timeframe": "5m",
+    "equity_initial": 25000,
+    "risk_pct": 0.02,
+    "vol_window": 20,
+    "body_min": 0.7,
+    "vol_rel_min": 0.7,
+    "rsi_len": 14,
+    "atr_len": 14,
+    "sl_atr": 1.0,
+    "tp_atr": 3.0,
+    "exit_bars": 24,
+    "trailing_sl": true,
+    "trail_buffer_r": 0.1,
+    "cb_losses": 3,
+    "cb_cooldown_min": 60,
+    "disable_thursday_utc": true,
+    "no_trade_hours_berlin": [
+      9,
+      14,
+      15
+    ],
+    "rth_berlin": {
+      "start": "09:30",
+      "end": "17:30"
+    },
+    "vwap_distance_k": 0.2,
+    "value_per_point_per_size": 1
+  },
+  "risk": {
+    "bot_equity": 25000,
+    "risk_pct": 0.02,
+    "value_per_point_per_size": 1.0,
+    "exit_bars": 24
+  },
+  "trailing": {
+    "enabled": true,
+    "buffer_r": 0.1
+  },
+  "circuit_breaker": {
+    "losses": 3,
+    "cooldown_min": 60
+  },
+  "notifications": {
+    "email_enabled": true
+  },
+  "startup_smoke_test": {
+    "enabled": false,
+    "direction": "BUY",
+    "size": 0.1,
+    "sleep_seconds": 5,
+    "force_demo_only": true
+  },
+  "startup_test": {
+    "enabled": false
+  }
+}

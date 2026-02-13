@@ -1,0 +1,105 @@
+from __future__ import annotations
+
+import logging
+from typing import Any
+
+log = logging.getLogger(__name__)
+
+def email_event(ok: bool, bot_id: str, event: str, payload: Any, *, logfile: str = "", cfg=None) -> None:
+    """
+    SMTP email sender.
+
+    Required env:
+      EMAIL_TO, SMTP_HOST, SMTP_PORT (default 587), SMTP_USER, SMTP_PASS
+    Optional:
+      EMAIL_FROM (defaults to EMAIL_TO)
+
+    IMPORTANT: Never raise to caller (do not break trading loop).
+    """
+    import os, json, smtplib, ssl
+    from email.message import EmailMessage
+
+    try:
+        to_addr = os.environ.get("EMAIL_TO") or os.environ.get("MAIL_TO")
+        host = os.environ.get("SMTP_HOST")
+        port = int(os.environ.get("SMTP_PORT", "587"))
+        user = os.environ.get("SMTP_USER")
+        pwd  = os.environ.get("SMTP_PASS")
+        from_addr = os.environ.get("EMAIL_FROM") or to_addr
+
+        if not to_addr or not host or not user or not pwd:
+            log.warning("EMAIL_SKIPPED missing env vars: EMAIL_TO/SMTP_HOST/SMTP_USER/SMTP_PASS")
+            return
+
+        subj = f"[{bot_id}] {event} {'OK' if ok else 'FAIL'}"
+        msg = EmailMessage()
+        msg["To"] = to_addr
+        msg["From"] = from_addr
+        msg["Subject"] = subj
+
+        body = {
+            "ok": ok,
+            "bot_id": bot_id,
+            "event": event,
+            "payload": payload,
+            "logfile": logfile,
+        }
+        msg.set_content(json.dumps(body, indent=2, ensure_ascii=False))
+
+        ctx = ssl.create_default_context()
+        with smtplib.SMTP(host, port, timeout=25) as s:
+            s.ehlo()
+            if port in (587, 25):
+                s.starttls(context=ctx)
+                s.ehlo()
+            s.login(user, pwd)
+            s.send_message(msg)
+
+        log.info("EMAIL_SENT to=%s subj=%s", to_addr, subj)
+
+    except Exception as e:
+        # Do NOT break the bot for email problems
+        log.exception("EMAIL_FAILED: %r", e)
+        return
+
+def email_startup(*args, **kwargs):
+    """
+    Backward/forward compatible startup email wrapper.
+    Allows calls like:
+      email_startup(email_enabled, bot_id, cfg, logfile)
+      email_startup(bot_id, cfg)
+      email_startup(cfg)
+    and never crashes the bot at import/startup time.
+    """
+    # defaults
+    email_enabled = True
+    bot_id = "unknown"
+    cfg = None
+    logfile = None
+
+    # positional parsing (best-effort)
+    if len(args) >= 1:
+        email_enabled = args[0]
+    if len(args) >= 2:
+        bot_id = args[1]
+    if len(args) >= 3:
+        cfg = args[2]
+    if len(args) >= 4:
+        logfile = args[3]
+
+    # keyword overrides
+    email_enabled = kwargs.get("email_enabled", email_enabled)
+    bot_id = kwargs.get("bot_id", bot_id)
+    cfg = kwargs.get("cfg", cfg)
+    logfile = kwargs.get("logfile", logfile)
+
+    try:
+        payload = {}
+        if isinstance(cfg, dict):
+            for k in ("poll_seconds", "resolution", "symbol", "rth_enabled"):
+                if k in cfg:
+                    payload[k] = cfg[k]
+        return email_event(bool(email_enabled), str(bot_id), "STARTUP", payload, logfile)
+    except Exception:
+        # Never allow notifier to crash the trading engine
+        return None

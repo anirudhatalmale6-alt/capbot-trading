@@ -1,0 +1,125 @@
+from typing import Any, Dict
+from capbot.domain.logger import log_line
+
+try:
+    from email_notify import send_trade_email
+except Exception:
+    send_trade_email = None
+
+def _send(enabled: bool, subject: str, body: str, logfile) -> None:
+    if not enabled or not send_trade_email:
+        return
+    ok = False
+    try:
+        ok = bool(send_trade_email(subject, body))
+    except Exception:
+        ok = False
+    log_line(logfile, f"EMAIL {'OK' if ok else 'SKIP/FAIL'} subject={subject}")
+
+def email_startup(enabled: bool, bot_id: str, cfg: Dict[str, Any], logfile) -> None:
+    _send(enabled, f"[{bot_id}] Startup OK", f"bot_id={bot_id}\nmarket={cfg.get('market')}\nstrategy={cfg.get('strategy',{}).get('module')}", logfile)
+
+def email_event(enabled: bool, bot_id: str, event: str, data, logfile) -> None:
+    """Send a pretty HTML email (and plain text fallback) for bot events."""
+    if not enabled:
+        return
+    data = data or {}
+    try:
+        import os, smtplib
+        import socket
+        from datetime import datetime, timezone
+        try:
+            from zoneinfo import ZoneInfo
+        except Exception:
+            ZoneInfo = None
+        from email.mime.multipart import MIMEMultipart
+        from email.mime.text import MIMEText
+        from capbot.notify import email_templates as T
+    except Exception:
+        return
+
+    # Env
+    SMTP_HOST = os.environ.get('SMTP_HOST', '')
+    SMTP_PORT = int(os.environ.get('SMTP_PORT', '587') or 587)
+    SMTP_USER = os.environ.get('SMTP_USER', '')
+    SMTP_PASS = os.environ.get('SMTP_PASS', '')
+    EMAIL_TO  = os.environ.get('EMAIL_TO', '')
+    EMAIL_FROM = os.environ.get('EMAIL_FROM', SMTP_USER or 'capbot@localhost')
+
+    if not SMTP_HOST or not EMAIL_TO:
+        return
+
+    now_utc = datetime.now(timezone.utc)
+    tz_name = str(data.get('tz') or os.environ.get('BOT_TZ') or 'UTC')
+    if ZoneInfo:
+        try:
+            now_local = now_utc.astimezone(ZoneInfo(tz_name))
+        except Exception:
+            now_local = now_utc
+    else:
+        now_local = now_utc
+
+    market = str(data.get('market') or bot_id)
+
+    # Sanitize payload: corta strings, evita objetos raros
+    payload = {}
+    for k, v in (data or {}).items():
+        if v is None:
+            continue
+        if isinstance(v, (dict, list, tuple, set)):
+            # no dumps enormes; solo una línea
+            v = str(v)
+        s = str(v)
+        if len(s) > 400:
+            s = s[:400] + '…'
+        payload[str(k)] = s
+
+        meta = {
+        'ts_utc': now_utc.strftime('%Y-%m-%d %H:%M:%SZ'),
+        'ts_local': now_local.strftime('%Y-%m-%d %H:%M:%S %Z'),
+        'bot_id': bot_id,
+        'service': (payload.get('service') or os.environ.get('CAPBOT_SERVICE') or bot_id),
+        'host': (payload.get('host') or os.environ.get('HOSTNAME') or socket.gethostname()),
+        'build': (payload.get('build') or os.environ.get('ENGINE_BUILD_TAG') or ''),
+        'config_path': (payload.get('config_path') or os.environ.get('CAPBOT_CONFIG') or ''),
+        'logfile': (payload.get('logfile') or os.environ.get('CAPBOT_LOGFILE') or ''),
+    }
+
+    extra = ''
+    if event in ('ENTRY_OPENED','EXIT_TP','EXIT_SL','EXIT_TIME','EXIT_RTH'):
+        if payload.get('deal_id'):
+            extra = 'deal ' + payload.get('deal_id')
+
+    subj = T.subject(event, market, extra=extra)
+    html = T.render_html(event, market, payload, meta)
+    text = T.render_text(event, market, payload, meta)
+
+    msg = MIMEMultipart('alternative')
+    msg['From'] = EMAIL_FROM
+    msg['To'] = EMAIL_TO
+    msg['Subject'] = subj
+    msg.attach(MIMEText(text, 'plain', 'utf-8'))
+    msg.attach(MIMEText(html, 'html', 'utf-8'))
+
+    rcpts = [x.strip() for x in EMAIL_TO.split(',') if x.strip()]
+    try:
+        s = smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=20)
+        try:
+            s.ehlo()
+            if SMTP_PORT in (587, 25):
+                try:
+                    s.starttls()
+                    s.ehlo()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        if SMTP_USER and SMTP_PASS:
+            try:
+                s.login(SMTP_USER, SMTP_PASS)
+            except Exception:
+                pass
+        s.sendmail(EMAIL_FROM, rcpts, msg.as_string())
+        s.quit()
+    except Exception:
+        return

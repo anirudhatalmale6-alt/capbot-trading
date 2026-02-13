@@ -1,0 +1,5 @@
+Apply:
+1) Stop service: sudo systemctl stop capbot-germany40.service
+2) Backup: cp -a /opt/capbot_full /opt/capbot_full.BAK_$(date +%F_%H%M)
+3) Unzip into repo root: unzip -o capbot_germany40_robust_hotfix.zip -d /opt/capbot_full
+4) Start: sudo systemctl start capbot-germany40.service

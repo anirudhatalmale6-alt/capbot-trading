@@ -1,0 +1,70 @@
+import pandas as pd
+import pytz
+
+def rsi(series: pd.Series, period: int) -> pd.Series:
+    delta = series.diff()
+    up = delta.clip(lower=0).rolling(period).mean()
+    dn = (-delta).clip(lower=0).rolling(period).mean()
+    rs = up / dn.replace(0, pd.NA)
+    return 100 - (100 / (1 + rs))
+
+def atr(df: pd.DataFrame, period: int) -> pd.Series:
+    prev_close = df["close"].shift(1)
+    tr = pd.concat(
+        [(df["high"] - df["low"]).abs(),
+         (df["high"] - prev_close).abs(),
+         (df["low"] - prev_close).abs()],
+        axis=1,
+    ).max(axis=1)
+    return tr.rolling(period).mean()
+
+def vwap_intraday(df: pd.DataFrame, tz_name: str) -> pd.Series:
+    """
+    Intraday VWAP (resets each local day in tz_name).
+    Robust to feeds with missing/zero volume (common for indices/CFDs):
+    - picks a volume-like column if present
+    - if volume missing or all zeros, falls back to vol=1 per bar
+    """
+    if df is None or df.empty:
+        return pd.Series(dtype="float64")
+
+    # Make sure we have a tz-aware index we can convert
+    idx = df.index
+    if getattr(idx, "tz", None) is None:
+        idx = idx.tz_localize("UTC")
+    idx_local = idx.tz_convert(tz_name)
+
+    # Choose volume column
+    vol = None
+    for c in ("volume", "vol", "tick_volume", "tickVolume", "Volume"):
+        if c in df.columns:
+            vol = df[c]
+            break
+
+    if vol is None:
+        vol = pd.Series(1.0, index=df.index)
+    else:
+        vol = pd.to_numeric(vol, errors="coerce").fillna(0.0)
+
+    # If the whole series is zero, VWAP would be 0/0 -> NaN. Use vol=1 fallback.
+    if float(vol.sum()) == 0.0:
+        vol = pd.Series(1.0, index=df.index)
+
+    # Typical price proxy
+    if all(c in df.columns for c in ("high", "low", "close")):
+        tp = (pd.to_numeric(df["high"], errors="coerce") +
+              pd.to_numeric(df["low"], errors="coerce") +
+              pd.to_numeric(df["close"], errors="coerce")) / 3.0
+    else:
+        tp = pd.to_numeric(df.get("close", pd.Series(index=df.index, dtype="float64")), errors="coerce")
+
+    # group by local day so it resets at local midnight
+    day = pd.Series(idx_local.date, index=df.index)
+
+    pv = (tp * vol)
+    cum_pv = pv.groupby(day).cumsum()
+    cum_v  = vol.groupby(day).cumsum()
+
+    vwap = cum_pv / cum_v
+    return vwap
+

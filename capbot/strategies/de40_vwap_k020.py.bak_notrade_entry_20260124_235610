@@ -1,0 +1,173 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Any, Dict, Optional
+
+import numpy as np
+import pandas as pd
+
+# Importa helpers existentes en el mismo archivo original (si estaban ahí).
+# Si en tu archivo original estaban definidas estas funcs abajo, déjalas tal cual.
+# Aquí asumo que ya existen: _rsi_wilder, _atr_wilder, _vwap_daily_berlin.
+from capbot.strategies.vwap_pullback_rsi import Signal  # mismo dataclass usado en tu repo
+
+class DE40VWAPK020:
+    """
+    Estrategia DE40/GER40 5m — VWAP diario + filtro distancia VWAP (k=0.20)
+    Señal con vela cerrada; entrada en open de la vela siguiente (lo hace el engine).
+    """
+
+    def enrich(self, df: pd.DataFrame, params: Dict[str, Any]) -> pd.DataFrame:
+        out = df.copy()
+
+        vol_window = int(params.get("VOL_WINDOW", 20))
+
+        # Soportar ambos nombres: RSI_LEN o RSI_PERIOD
+        rsi_len = int(params.get("RSI_LEN", params.get("RSI_PERIOD", 14)))
+        atr_len = int(params.get("ATR_LEN", params.get("ATR_PERIOD", 14)))
+
+        tz = str(params.get("VWAP_TZ", "Europe/Berlin"))
+
+        # Body ratio
+        rng = (out["high"] - out["low"]).replace(0, np.nan)
+        out["body_ratio"] = (out["close"] - out["open"]).abs() / rng
+        out["body_ratio"] = out["body_ratio"].fillna(0.0)
+
+        # Vol rel
+        out["vol_sma"] = out["volume"].rolling(vol_window).mean()
+        out["vol_rel"] = out["volume"] / out["vol_sma"].replace(0, np.nan)
+
+        # Prev3 bears/bulls (shift(1).rolling(3).sum())
+        is_bear = (out["close"] < out["open"]).astype(int)
+        is_bull = (out["close"] > out["open"]).astype(int)
+        out["bear_prev3"] = is_bear.shift(1).rolling(3).sum()
+        out["bull_prev3"] = is_bull.shift(1).rolling(3).sum()
+
+        # RSI / ATR Wilder
+        from capbot.strategies.vwap_pullback_rsi import rsi_wilder as _rsi_wilder
+        from capbot.strategies.vwap_pullback_rsi import atr_wilder as _atr_wilder
+        from capbot.strategies.vwap_pullback_rsi import vwap_daily_berlin as _vwap_daily_berlin
+
+        out["rsi14"] = _rsi_wilder(out["close"], rsi_len)
+        out["atr14"] = _atr_wilder(out, atr_len)
+
+        # VWAP diario reset 00:00 Berlin con typical price
+        out["vwap"] = _vwap_daily_berlin(out, tz)
+
+        return out
+
+    def signal_on_bar_close(self, df: pd.DataFrame, params: Dict[str, Any]) -> Optional[Signal]:
+        if df is None or len(df) < 50:
+            return None
+
+        # signal_bar = última cerrada
+        i = -2
+        row = df.iloc[i]
+        ts_utc = df.index[i]  # tz-aware UTC en el motor
+        tz = str(params.get("VWAP_TZ", "Europe/Berlin"))
+        ts_local = ts_utc.tz_convert(tz)
+
+        # Parámetros
+        BODY_MIN = float(params.get("BODY_MIN", 0.70))
+        VOL_REL_MIN = float(params.get("VOL_REL_MIN", 0.70))
+        RSI_LONG_MAX = float(params.get("RSI_LONG_MAX", 75))
+        RSI_SHORT_MIN = float(params.get("RSI_SHORT_MIN", 40))
+        BEAR_PREV3_LONG = int(params.get("BEAR_PREV3_LONG", 2))
+        BULL_PREV3_SHORT = int(params.get("BULL_PREV3_SHORT", 2))
+        VWAP_DISTANCE_K = float(params.get("VWAP_DISTANCE_K", 0.20))
+
+        # Horarios (Berlin) + jueves UTC
+        disable_thursday_utc = bool(params.get("DISABLE_THURSDAY_UTC", True))
+        no_trade_hours = set(params.get("NO_TRADE_HOURS_BERLIN", [9, 14, 15]))
+        rth_start = str(params.get("RTH_START", "09:30"))
+        rth_end = str(params.get("RTH_END", "17:30"))
+
+        sh, sm = map(int, rth_start.split(":"))
+        eh, em = map(int, rth_end.split(":"))
+        start_ok = (ts_local.hour > sh) or (ts_local.hour == sh and ts_local.minute >= sm)
+        end_ok = (ts_local.hour < eh) or (ts_local.hour == eh and ts_local.minute <= em)
+        in_rth = start_ok and end_ok
+
+        if disable_thursday_utc and ts_utc.weekday() == 3:
+            return None
+        if not in_rth:
+            return None
+        if ts_local.hour in no_trade_hours:
+            return None
+
+        # Validaciones
+        need_cols = ["body_ratio", "vol_rel", "rsi14", "atr14", "vwap", "bear_prev3", "bull_prev3"]
+        for c in need_cols:
+            if c not in df.columns:
+                return None
+            v = row.get(c)
+            if v is None or (isinstance(v, float) and (np.isnan(v) or np.isinf(v))):
+                return None
+
+        body_ratio = float(row["body_ratio"])
+        vol_rel = float(row["vol_rel"])
+        rsi = float(row["rsi14"])
+        atr = float(row["atr14"])
+        vwap = float(row["vwap"])
+        close = float(row["close"])
+        open_ = float(row["open"])
+        bear_prev3 = float(row["bear_prev3"])
+        bull_prev3 = float(row["bull_prev3"])
+
+        if body_ratio < BODY_MIN:
+            return None
+        if vol_rel < VOL_REL_MIN:
+            return None
+
+        # Filtro distancia VWAP EXACTO spec: abs(close-vwap) >= k * ATR
+        if atr <= 0:
+            return None
+        if abs(close - vwap) < (VWAP_DISTANCE_K * atr):
+            return None
+
+        # Señales
+        if (close > vwap) and (bear_prev3 >= BEAR_PREV3_LONG) and (rsi <= RSI_LONG_MAX) and (close > open_):
+            return Signal(direction="BUY", entry_price_est=close, meta={
+                "ts_signal_utc": ts_utc.isoformat(),
+                "ts_signal_local": ts_local.isoformat(),
+                "close": close, "vwap": vwap, "rsi14": rsi, "atr14": atr,
+                "body_ratio": body_ratio, "vol_rel": vol_rel,
+                "bear_prev3": bear_prev3,
+            })
+
+        if (close < vwap) and (bull_prev3 >= BULL_PREV3_SHORT) and (rsi >= RSI_SHORT_MIN) and (close < open_):
+            return Signal(direction="SELL", entry_price_est=close, meta={
+                "ts_signal_utc": ts_utc.isoformat(),
+                "ts_signal_local": ts_local.isoformat(),
+                "close": close, "vwap": vwap, "rsi14": rsi, "atr14": atr,
+                "body_ratio": body_ratio, "vol_rel": vol_rel,
+                "bull_prev3": bull_prev3,
+            })
+
+        return None
+
+    def initial_risk(self, entry_price: float, atr_v: float, sig: Signal, params: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        EXACTO spec:
+          R_pts = SL_ATR * ATR14(signal_bar)
+          Long: SL = entry - 1R ; TP = entry + TP_R_MULTIPLE*R
+          Short: SL = entry + 1R ; TP = entry - TP_R_MULTIPLE*R
+        """
+        SL_ATR = float(params.get("SL_ATR", 1.0))
+        TP_R_MULTIPLE = float(params.get("TP_R_MULTIPLE", 3.0))
+
+        r_points = SL_ATR * float(atr_v)
+
+        if sig.direction == "BUY":
+            sl = float(entry_price) - r_points
+            tp = float(entry_price) + (TP_R_MULTIPLE * r_points)
+        else:
+            sl = float(entry_price) + r_points
+            tp = float(entry_price) - (TP_R_MULTIPLE * r_points)
+
+        return {
+            "r_points": float(r_points),
+            "sl_local": float(sl),
+            "tp_local": float(tp),
+            "tp_r_multiple": float(TP_R_MULTIPLE),
+        }

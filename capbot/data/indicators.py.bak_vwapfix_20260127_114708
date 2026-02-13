@@ -1,0 +1,28 @@
+import pandas as pd
+import pytz
+
+def rsi(series: pd.Series, period: int) -> pd.Series:
+    delta = series.diff()
+    up = delta.clip(lower=0).rolling(period).mean()
+    dn = (-delta).clip(lower=0).rolling(period).mean()
+    rs = up / dn.replace(0, pd.NA)
+    return 100 - (100 / (1 + rs))
+
+def atr(df: pd.DataFrame, period: int) -> pd.Series:
+    prev_close = df["close"].shift(1)
+    tr = pd.concat(
+        [(df["high"] - df["low"]).abs(),
+         (df["high"] - prev_close).abs(),
+         (df["low"] - prev_close).abs()],
+        axis=1,
+    ).max(axis=1)
+    return tr.rolling(period).mean()
+
+def vwap_intraday(df: pd.DataFrame, tz_name: str) -> pd.Series:
+    tz = pytz.timezone(tz_name)
+    d = df.copy()
+    d["session_date"] = d["time"].dt.tz_convert(tz).dt.date
+    tp = (d["high"] + d["low"] + d["close"]) / 3.0
+    vol = d["volume"].replace(0, pd.NA).fillna(1.0)
+    pv = tp * vol
+    return (pv.groupby(d["session_date"]).cumsum() / vol.groupby(d["session_date"]).cumsum()).astype("float64")

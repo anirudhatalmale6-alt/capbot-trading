@@ -1,0 +1,17 @@
+from __future__ import annotations
+from typing import Any
+import logging
+
+log = logging.getLogger(__name__)
+
+def email_startup(*args: Any, **kwargs: Any) -> None:
+    try:
+        log.info("email_startup() called (safe no-op). args=%s kwargs=%s", args, kwargs)
+    except Exception:
+        pass
+
+def email_event(*args: Any, **kwargs: Any) -> None:
+    try:
+        log.info("email_event() called (safe no-op). args=%s kwargs=%s", args, kwargs)
+    except Exception:
+        pass

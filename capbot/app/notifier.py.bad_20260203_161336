@@ -1,0 +1,125 @@
+import time
+from __future__ import annotations
+
+import logging
+from typing import Any
+
+log = logging.getLogger(__name__)
+
+def _json_default(o: Any):
+    # Nunca explotes por tipos raros en payload (Path, datetime, etc)
+    try:
+        from pathlib import Path
+        if isinstance(o, Path):
+            return str(o)
+    except Exception:
+        pass
+
+    try:
+        import datetime as _dt
+        if isinstance(o, (_dt.datetime, _dt.date)):
+            return o.isoformat()
+    except Exception:
+        pass
+
+    try:
+        if isinstance(o, bytes):
+            return o.decode("utf-8", "replace")
+    except Exception:
+        pass
+
+    # fallback estable
+    retu
+# --- STARTUP/SPAM GUARD (only for startup-ish events) ---
+_DEDUPE_PATH = Path("/tmp/capbot_email_dedupe.json")
+def _should_dedupe_startup(bot_id: str, event: str, cooldown_sec: int = 1800) -> bool:
+    # Only dedupe noisy events. Keep trade/alert emails untouched.
+    noisy = {"STARTUP", "SERVICE_START", "BOOT"}
+    if event not in noisy:
+        return False
+    now = int(time.time())
+    try:
+        data = json.loads(_DEDUPE_PATH.read_text(encoding="utf-8")) if _DEDUPE_PATH.exists() else {}
+    except Exception:
+        data = {}
+    key = f"{bot_id}:{event}"
+    last = int(data.get(key, 0) or 0)
+    if now - last < cooldown_sec:
+        return True
+    data[key] = now
+    try:
+        _DEDUPE_PATH.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+    return False
+# --- end guard ---
+rn repr(o)
+
+def email_event(ok: bool, bot_id: str, event: str, payload: Any, *, logfile: str = "", cfg=None) -> bool:
+    """
+    SMTP email sender.
+
+    Required env:
+      EMAIL_TO, SMTP_HOST, SMTP_PORT (default 587), SMTP_USER, SMTP_PASS
+    Optional:
+      EMAIL_FROM (defaults to EMAIL_TO)
+
+    IMPORTANT: Never raise to caller (do not break trading loop).
+    Returns True if sent, False otherwise.
+    """
+    import os, json, smtplib, ssl
+    from email.message import EmailMessage
+
+    try:
+        to_addr = os.environ.get("EMAIL_TO") or os.environ.get("MAIL_TO")
+        host = os.environ.get("SMTP_HOST")
+        port = int(os.environ.get("SMTP_PORT", "587"))
+        user = os.environ.get("SMTP_USER")
+        pwd  = os.environ.get("SMTP_PASS")
+        from_addr = os.environ.get("EMAIL_FROM") or to_addr
+
+        if not to_addr or not host or not user or not pwd:
+            log.warning("EMAIL_SKIPPED missing env vars: EMAIL_TO/SMTP_HOST/SMTP_USER/SMTP_PASS")
+            return False
+
+        subj = f"[{bot_id}] {event} {'OK' if ok else 'FAIL'}"
+        msg = EmailMessage()
+        msg["To"] = to_addr
+        msg["From"] = from_addr
+        msg["Subject"] = subj
+
+        body = {
+            "ok": ok,
+            "bot_id": bot_id,
+            "event": event,
+            "payload": payload,
+            "logfile": logfile,
+        }
+        msg.set_content(json.dumps(body, indent=2, ensure_ascii=False, default=_json_default))
+
+        ctx = ssl.create_default_context()
+        with smtplib.SMTP(host, port, timeout=25) as s:
+            s.ehlo()
+            if port in (587, 25):
+    if _should_dedupe_startup(str(bot_id), str(event)):
+        log.info("EMAIL_SKIPPED: dedupe %s %s", bot_id, event)
+        return False
+                s.starttls(context=ctx)
+                s.ehlo()
+            s.login(user, pwd)
+            s.send_message(msg)
+
+        log.info("EMAIL_SENT to=%s subj=%s", to_addr, subj)
+        return True
+
+    except Exception as e:
+        log.exception("EMAIL_FAILED: %r", e)
+        return False
+
+
+def email_startup(enabled: bool, bot_id: str, body: dict, subject_prefix: str = "") -> bool:
+    # Backward compatible wrapper used by older engines
+    try:
+        return email_event(enabled, bot_id, "STARTUP", body, subject_prefix)
+    except Exception:
+        return False

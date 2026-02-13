@@ -1,0 +1,880 @@
+import os
+import time
+from typing import Any, Dict, Optional
+
+import pandas as pd
+
+from capbot.app.notifier import email_event, email_startup
+from capbot.broker.capital_client import CapitalClient, pick_position_dealid_from_confirm
+from capbot.data.prices import prices_to_df
+from capbot.domain.lock import InstanceLock
+from capbot.domain.logger import log_line
+from capbot.domain.paths import bot_paths
+from capbot.domain.risk import calc_position_size
+from capbot.domain.schedule import RTH
+from capbot.domain.state_store import load_state, save_state_atomic
+from capbot.domain.trade_log import append_row, ensure_header
+from capbot.domain.trailing import maybe_trail_option_a
+from capbot.strategies.loader import load_strategy
+
+
+def utc_now() -> pd.Timestamp:
+    return pd.Timestamp.now(tz="UTC")
+
+
+def _as_ts(x: Optional[str]) -> Optional[pd.Timestamp]:
+    if not x:
+        return None
+    try:
+        return pd.to_datetime(x, utc=True)
+    except Exception:
+        return None
+
+
+def _resolution_to_minutes(resolution: str) -> int:
+    r = (resolution or "").upper().strip()
+    if r.startswith("MINUTE_"):
+        try:
+            return int(r.split("_", 1)[1])
+        except Exception:
+            return 5
+    if r in ("HOUR", "HOUR_1"):
+        return 60
+    if r == "HOUR_4":
+        return 240
+    if r == "DAY":
+        return 1440
+    return 5
+
+
+def _rth_is_open(rth: RTH, ts: pd.Timestamp) -> bool:
+    fn = getattr(rth, "is_open", None)
+    if callable(fn):
+        return bool(fn(ts))
+
+    # fallback manual
+    import pytz
+    tz = pytz.timezone(getattr(rth, "tz_name", "UTC"))
+    local = ts.tz_convert(tz)
+    if local.weekday() >= 5:
+        return False
+    sh = int(getattr(rth, "start_hh", 0))
+    sm = int(getattr(rth, "start_mm", 0))
+    eh = int(getattr(rth, "end_hh", 23))
+    em = int(getattr(rth, "end_mm", 59))
+    start = local.replace(hour=sh, minute=sm, second=0, microsecond=0)
+    end = local.replace(hour=eh, minute=em, second=0, microsecond=0)
+    return start <= local <= end
+
+
+def run_bot(cfg: Dict[str, Any], once: bool = False):
+    bot_id = str(cfg.get("bot_id") or (cfg.get("market") or {}).get("epic") or "capbot")
+
+    state_path, csv_path, logfile, lock_path = bot_paths(bot_id)
+
+    try:
+        lock = InstanceLock(lock_path, 1800)
+    except TypeError:
+        lock = InstanceLock(lock_path)
+
+    def save_state(st: dict):
+        save_state_atomic(state_path, st)
+
+    lock.acquire()
+    try:
+        ensure_header(csv_path)
+        st = load_state(state_path) or {}
+
+        poll = int(cfg.get("poll_seconds", 30))
+
+        # ---- Market / data ----
+        market = cfg.get("market") or {}
+        epic = str(market.get("epic") or "").strip()
+        resolution = str(market.get("resolution") or "MINUTE_5").strip()
+        warmup = int(market.get("warmup_bars", 200))
+        if not epic:
+            raise RuntimeError("Config error: market.epic is missing")
+
+        bar_minutes = _resolution_to_minutes(resolution)
+
+        # ---- Schedule ----
+        schedule_cfg = cfg.get("schedule") or {}
+        tz_name = str(schedule_cfg.get("timezone", "Europe/Berlin"))
+        rth_enabled = bool(schedule_cfg.get("rth_enabled", True))
+        disable_thursday_utc = bool(schedule_cfg.get("disable_thursday_utc", True))
+
+        rth_start = str(schedule_cfg.get("rth_start", "09:30"))
+        rth_end = str(schedule_cfg.get("rth_end", "17:30"))
+
+        rth = RTH(
+            tz_name=tz_name,
+            start_hh=int(rth_start.split(":")[0]),
+            start_mm=int(rth_start.split(":")[1]),
+            end_hh=int(rth_end.split(":")[0]),
+            end_mm=int(rth_end.split(":")[1]),
+        )
+
+        # ---- Risk ----
+        risk_cfg = cfg.get("risk") or {}
+        bot_equity = float(risk_cfg.get("bot_equity", 25000.0))
+        risk_pct = float(risk_cfg.get("risk_pct", 0.02))
+        vpp = float(risk_cfg.get("value_per_point_per_size", 1.0))
+        exit_bars = int(risk_cfg.get("exit_bars", 24))
+
+        # ---- Trailing ----
+        trailing_cfg = cfg.get("trailing") or {}
+        trailing_on = bool(trailing_cfg.get("enabled", True))
+        trail_buffer_r = float(trailing_cfg.get("buffer_r", 0.10))
+
+        # ---- Circuit breaker ----
+        cb_cfg = cfg.get("circuit_breaker") or {}
+        cb_losses = int(cb_cfg.get("losses", 3))
+        cb_cooldown = int(cb_cfg.get("cooldown_min", 60))
+
+        # ---- Notifications ----
+        notif_cfg = cfg.get("notifications") or {}
+        email_enabled = bool(notif_cfg.get("email_enabled", True))
+
+        # ---- Strategy ----
+        strategy_cfg = cfg.get("strategy") or {}
+        strat = load_strategy(strategy_cfg.get("module"))
+        strat_params = strategy_cfg.get("params") or {}
+
+        # ---- Account selection ----
+        account_cfg = cfg.get("account") or {}
+        account_id = account_cfg.get("account_id") or os.environ.get("CAPITAL_ACCOUNT_ID")
+
+        client = CapitalClient()
+        email_startup(email_enabled, bot_id, cfg, logfile)
+
+        last_closed_time = _as_ts(st.get("last_closed_time"))
+
+        while True:
+            now = utc_now()
+
+            # ---- Heartbeat diario al abrir RTH (Berlin) ----
+            try:
+                now_local = now.tz_convert(tz_name)
+                if now_local.weekday() < 5:
+                    sh, sm = map(int, rth_start.split(":"))
+                    if now_local.hour == sh and now_local.minute == sm:
+                        sent_date = st.get("heartbeat_sent_date")
+                        today = now_local.date().isoformat()
+                        if sent_date != today:
+                            email_event(email_enabled, bot_id, "HEARTBEAT_RTH_OPEN", {
+                                "time_local": now_local.isoformat(),
+                                "timezone": tz_name,
+                                "account_id": account_id,
+                                "epic": epic,
+                                "poll_seconds": poll,
+                            }, logfile)
+                            st["heartbeat_sent_date"] = today
+                            save_state(st)
+            except Exception as e:
+                log_line(logfile, f"HEARTBEAT warning: {repr(e)}")
+
+            # Ensure session + correct account
+            client.login()
+            client.ensure_account(account_id)
+
+            pos = st.get("pos") or {}
+            deal_id = pos.get("deal_id")
+            in_position = bool(deal_id)
+
+            # ===========================
+            # 9) Gestión si hay posición
+            # ===========================
+            if in_position:
+                px = client.get_prices(epic, resolution, max_points=max(warmup, 200))
+                df = prices_to_df(px)
+                if df is None or df.empty or len(df) < 3:
+                    log_line(logfile, "WARN: no prices returned")
+                    if once:
+                        return
+                    time.sleep(poll)
+                    continue
+
+                # Siempre con la vela cerrada (determinista)
+                bar_t = df.index[-2]
+                last_mgmt = st.get("last_mgmt_bar_iso")
+                if last_mgmt and str(last_mgmt) == str(bar_t.isoformat()):
+                    if once:
+                        return
+                    time.sleep(poll)
+                    continue
+
+                st["last_mgmt_bar_iso"] = bar_t.isoformat()
+                save_state(st)
+
+                bar = df.iloc[-2]
+                close_px = float(bar["close"])
+                bar_high = float(bar["high"])
+                bar_low = float(bar["low"])
+
+                direction = str(pos.get("direction")).upper()
+
+                # 1) OUTSIDE_RTH (Berlin): cerrar a mercado.
+                if rth_enabled and (not _rth_is_open(rth, now)):
+                    exit_price = close_px  # convención: close de la vela cerrada
+                    conf = client.close_position(str(deal_id))
+                    append_row(csv_path, now.isoformat(), bot_id, epic, direction, pos.get("size"), "EXIT_RTH", exit_price, conf)
+
+                    # Circuit breaker LOCAL al cerrar
+                    try:
+                        entry_price = float(pos.get("entry_price_est"))
+                        size_pos = float(pos.get("size"))
+                        profit_points = (exit_price - entry_price) if direction == "BUY" else (entry_price - exit_price)
+                        profit_cash = profit_points * size_pos * vpp
+                        consec = int(st.get("consec_losses", 0))
+                        consec = (consec + 1) if profit_cash < 0 else 0
+                        st["consec_losses"] = consec
+                        if consec >= cb_losses:
+                            st["cooldown_until_iso"] = (now + pd.Timedelta(minutes=cb_cooldown)).isoformat()
+                    except Exception:
+                        pass
+
+                    st["pos"] = {}
+                    st["last_closed_time"] = now.isoformat()
+                    save_state(st)
+                    email_event(email_enabled, bot_id, "EXIT_RTH", {"deal_id": deal_id, "exit_price": exit_price}, logfile)
+
+                    if once:
+                        return
+                    time.sleep(poll)
+                    continue
+
+                # 2) TIME_EXIT (2h desde entry_time)
+                planned_exit = _as_ts(pos.get("planned_exit_iso"))
+                if planned_exit and now >= planned_exit:
+                    exit_price = close_px
+                    conf = client.close_position(str(deal_id))
+                    append_row(csv_path, now.isoformat(), bot_id, epic, direction, pos.get("size"), "EXIT_TIME", exit_price, conf)
+
+                    try:
+                        entry_price = float(pos.get("entry_price_est"))
+                        size_pos = float(pos.get("size"))
+                        profit_points = (exit_price - entry_price) if direction == "BUY" else (entry_price - exit_price)
+                        profit_cash = profit_points * size_pos * vpp
+                        consec = int(st.get("consec_losses", 0))
+                        consec = (consec + 1) if profit_cash < 0 else 0
+                        st["consec_losses"] = consec
+                        if consec >= cb_losses:
+                            st["cooldown_until_iso"] = (now + pd.Timedelta(minutes=cb_cooldown)).isoformat()
+                    except Exception:
+                        pass
+
+                    st["pos"] = {}
+                    st["last_closed_time"] = now.isoformat()
+                    save_state(st)
+                    email_event(email_enabled, bot_id, "EXIT_TIME", {"deal_id": deal_id, "exit_price": exit_price}, logfile)
+
+                    if once:
+                        return
+                    time.sleep(poll)
+                    continue
+
+                # 3/4) STOP/TP con high/low (STOP primero si ambos)
+                sl_local = float(pos.get("sl_local"))
+                tp_local = float(pos.get("tp_local"))
+
+                hit_sl = (direction == "BUY" and bar_low <= sl_local) or (direction == "SELL" and bar_high >= sl_local)
+                hit_tp = (direction == "BUY" and bar_high >= tp_local) or (direction == "SELL" and bar_low <= tp_local)
+
+                if hit_sl or hit_tp:
+                    if hit_sl:
+                        reason = "EXIT_SL"
+                        exit_price = float(sl_local)
+                    else:
+                        reason = "EXIT_TP"
+                        exit_price = float(tp_local)
+
+                    conf = client.close_position(str(deal_id))
+                    append_row(csv_path, now.isoformat(), bot_id, epic, direction, pos.get("size"), reason, exit_price, conf)
+
+                    # Circuit breaker LOCAL
+                    try:
+                        entry_price = float(pos.get("entry_price_est"))
+                        size_pos = float(pos.get("size"))
+                        profit_points = (exit_price - entry_price) if direction == "BUY" else (entry_price - exit_price)
+                        profit_cash = profit_points * size_pos * vpp
+                        consec = int(st.get("consec_losses", 0))
+                        consec = (consec + 1) if profit_cash < 0 else 0
+                        st["consec_losses"] = consec
+                        if consec >= cb_losses:
+                            st["cooldown_until_iso"] = (now + pd.Timedelta(minutes=cb_cooldown)).isoformat()
+                    except Exception:
+                        pass
+
+                    st["pos"] = {}
+                    st["last_closed_time"] = now.isoformat()
+                    save_state(st)
+                    email_event(email_enabled, bot_id, reason, {"deal_id": deal_id, "exit_price": exit_price}, logfile)
+
+                    if once:
+                        return
+                    time.sleep(poll)
+                    continue
+
+                # 8) Trailing SL (solo mejora, al cierre)
+                if trailing_on:
+                    try:
+                        moved, new_sl, flags = maybe_trail_option_a(
+                            direction=direction,
+                            entry=float(pos.get("entry_price_est")),
+                            live=float(close_px),
+                            r_points=float(pos.get("r_points")),
+                            current_sl=float(pos.get("sl_local")),
+                            trail_1r_done=bool(pos.get("trail_1r_done")),
+                            trail_2r_done=bool(pos.get("trail_2r_done")),
+                            buffer_r=float(trail_buffer_r),
+                        )
+                        if moved:
+                            pos["sl_local"] = float(new_sl)
+                            pos["trail_1r_done"] = bool(flags.get("trail_1r_done"))
+                            pos["trail_2r_done"] = bool(flags.get("trail_2r_done"))
+                            st["pos"] = pos
+                            save_state(st)
+                            email_event(email_enabled, bot_id, "TRAIL_SL", {"deal_id": deal_id, "sl_local": new_sl}, logfile)
+                    except Exception as e:
+                        log_line(logfile, f"TRAIL warning: {repr(e)}")
+
+                if once:
+                    return
+                time.sleep(poll)
+                continue
+
+            # =======================
+            # 4) Gates de entradas
+            # =======================
+            # 1) No operar jueves UTC
+            if disable_thursday_utc and now.weekday() == 3:
+                log_line(logfile, "GATE: Thursday UTC disabled (entries blocked)")
+                if once:
+                    return
+                time.sleep(poll)
+                continue
+
+            # 2) Dentro de RTH Berlin
+            if rth_enabled and (not _rth_is_open(rth, now)):
+                log_line(logfile, f"GATE: outside RTH ({rth_start}-{rth_end} {tz_name})")
+                # VIS_ALWAYS_3LINES_SP500_OUTSIDE_RTH_V1_START
+            try:
+                if str(bot_id) == "sp500_5m":
+                    OK = "✅"
+                    NO = "❌"
+                    def ok(x): return OK if x else NO
+
+                    import math
+                    import pandas as pd
+
+                    _df = locals().get("df", None)
+                    if _df is None or (not hasattr(_df, "iloc")) or len(_df) < 2:
+                        raise ValueError("df missing/too short")
+
+                    _row = _df.iloc[-2]
+                    _ts_raw = _df.index[-2]
+
+                    _ts = pd.Timestamp(_ts_raw)
+                    if _ts.tzinfo is None:
+                        _ts_utc = _ts.tz_localize("UTC")
+                    else:
+                        _ts_utc = _ts.tz_convert("UTC")
+
+                    _ts_ny = _ts_utc.tz_convert("America/New_York")
+                    hhmm = (_ts_ny.hour, _ts_ny.minute)
+
+                    g_rth = (hhmm >= (9,30)) and (hhmm <= (16,0))
+                    g_thu = not (_ts_utc.weekday() == 3)   # no jueves UTC
+
+                    o = float(_row.get("open", float("nan")))
+                    c = float(_row.get("close", float("nan")))
+                    body = float(_row.get("body_ratio", float("nan")))
+                    volr = float(_row.get("vol_rel", float("nan")))
+                    rsi  = float(_row.get("rsi14", float("nan")))
+                    atr  = float(_row.get("atr14", float("nan")))
+                    bear3 = _row.get("bear_prev3", None)
+                    bull3 = _row.get("bull_prev3", None)
+                    rng   = float(_row.get("range", float("nan")))
+
+                    BODY_MIN      = 0.70
+                    VOL_REL_MIN   = 0.70
+                    RSI_LONG_MAX  = 75.0
+                    RSI_SHORT_MIN = 40.0
+                    BEAR3_LONG    = 2
+                    BULL3_SHORT   = 2
+
+                    def _isnum(x):
+                        try:
+                            return (x == x) and (not math.isinf(x))
+                        except Exception:
+                            return False
+
+                    valid = (
+                        _isnum(o) and _isnum(c) and _isnum(body) and _isnum(volr) and _isnum(rsi) and _isnum(atr) and _isnum(rng)
+                        and (bear3 is not None) and (bull3 is not None)
+                        and (rng > 0)
+                    )
+
+                    body_ok = bool(valid and body >= BODY_MIN)
+                    vol_ok  = bool(valid and volr >= VOL_REL_MIN)
+
+                    long_ok  = bool(valid and (c > o) and (float(bear3) >= BEAR3_LONG) and (rsi < RSI_LONG_MAX))
+                    short_ok = bool(valid and (c < o) and (float(bull3) >= BULL3_SHORT) and (rsi > RSI_SHORT_MIN))
+
+                    entry_ok = bool(g_thu and g_rth and valid and body_ok and vol_ok and (long_ok or short_ok))
+
+                    bv = ("nan" if body != body else "{:.3f}".format(body))
+                    vv = ("nan" if volr != volr else "{:.3f}".format(volr))
+                    rv = ("nan" if rsi  != rsi  else "{:.2f}".format(rsi))
+                    av = ("nan" if atr  != atr  else "{:.2f}".format(atr))
+
+                    ny_str = _ts_ny.strftime("%Y-%m-%d %H:%M")
+
+                    log_line(
+                        logfile,
+                        "VIS | sigNY={ny} | THU {thu} | RTH {rth} | VALID {val} | BODY {b}({bv}>={bmin}) | VOL {v}({vv}>={vmin}) | RSI {rv} | ATR {av}".format(
+                            ny=ny_str,
+                            thu=ok(g_thu), rth=ok(g_rth), val=ok(valid),
+                            b=ok(body_ok), bv=bv, bmin="{:.2f}".format(BODY_MIN),
+                            v=ok(vol_ok),  vv=vv, vmin="{:.2f}".format(VOL_REL_MIN),
+                            rv=rv, av=av,
+                        )
+                    )
+                    log_line(logfile, "LONG={L} SHORT={S} | bear3={b3} bull3={u3} |".format(
+                        L=ok(long_ok), S=ok(short_ok), b3=bear3, u3=bull3
+                    ))
+                    log_line(logfile, "ENTRY {E}".format(E=ok(entry_ok)))
+            except Exception as _e:
+                log_line(logfile, "VIS_ERR_ALWAYS_SP500_OUTSIDE: {}".format(repr(_e)))
+
+            # VIS_ALWAYS_3LINES_SP500_OUTSIDE_RTH_V1_END
+                # VIS_SP500_PRE_RTH_START
+                try:
+                    _bid = str(locals().get("bot_id") or locals().get("bot_id_") or "")
+                    if _bid == "sp500_5m":
+                        OK = "✅"
+                        NO = "❌"
+                        def ok(x): return OK if x else NO
+
+                        import math
+                        import pandas as pd
+
+                        # recalcula df_vis aquí para poder loguear AUNQUE el gate haga continue
+                        px_vis = client.get_prices(epic, resolution, max_points=max(warmup, 200))
+                        df_vis = prices_to_df(px_vis)
+
+                        if df_vis is None or df_vis.empty or len(df_vis) < 3:
+                            log_line(logfile, "VIS | THU {thu} | RTH {rth} | VALID {val} | BODY {b} | VOL {v} | RSI NA | ATR NA".format(
+                                thu=ok(not (disable_thursday_utc and now.weekday() == 3)),
+                                rth=ok((not rth_enabled) or _rth_is_open(rth, now)),
+                                val=NO, b=NO, v=NO
+                            ))
+                            log_line(logfile, "LONG={L} SHORT={S} | bear3=NA bull3=NA |".format(L=NO, S=NO))
+                            log_line(logfile, "ENTRY {E}".format(E=NO))
+                        else:
+                            df_vis = strat.enrich(df_vis, strat_params)
+
+                            _row = df_vis.iloc[-2]
+                            _ts_raw = df_vis.index[-2]
+
+                            # TS robusto: si sale NaT/epoch, usa now
+                            _ts = None
+                            try:
+                                _ts = pd.to_datetime(_ts_raw, utc=True, errors="coerce")
+                            except Exception:
+                                _ts = None
+
+                            if _ts is None or str(_ts) == "NaT" or int(getattr(_ts, "year", 0) or 0) < 2000:
+                                _ts = now
+
+                            _ts_ny = _ts.tz_convert("America/New_York")
+                            sigNY = _ts_ny.strftime("%Y-%m-%d %H:%M")
+
+                            o = float(_row.get("open", float("nan")))
+                            c = float(_row.get("close", float("nan")))
+                            body = float(_row.get("body_ratio", float("nan")))
+                            volr = float(_row.get("vol_rel", float("nan")))
+                            rsi  = float(_row.get("rsi14", float("nan")))
+                            atr  = float(_row.get("atr14", float("nan")))
+                            rng  = float(_row.get("range", float("nan")))
+                            bear3 = _row.get("bear_prev3", None)
+                            bull3 = _row.get("bull_prev3", None)
+
+                            BODY_MIN      = 0.70
+                            VOL_REL_MIN   = 0.70
+                            RSI_LONG_MAX  = 75.0
+                            RSI_SHORT_MIN = 40.0
+                            BEAR3_LONG    = 2
+                            BULL3_SHORT   = 2
+
+                            def _isnum(x):
+                                try:
+                                    return (x == x) and (not math.isinf(x))
+                                except Exception:
+                                    return False
+
+                            # gates (como engine)
+                            g_thu = not (disable_thursday_utc and now.weekday() == 3)
+                            g_rth = (not rth_enabled) or _rth_is_open(rth, now)
+
+                            valid = (
+                                _isnum(o) and _isnum(c) and _isnum(body) and _isnum(volr) and _isnum(rsi) and _isnum(atr) and _isnum(rng)
+                                and (bear3 is not None) and (bull3 is not None)
+                                and (rng > 0)
+                            )
+
+                            body_ok = bool(valid and body >= BODY_MIN)
+                            vol_ok  = bool(valid and volr >= VOL_REL_MIN)
+
+                            long_ok  = bool(valid and (c > o) and (float(bear3) >= BEAR3_LONG) and (rsi < RSI_LONG_MAX))
+                            short_ok = bool(valid and (c < o) and (float(bull3) >= BULL3_SHORT) and (rsi > RSI_SHORT_MIN))
+
+                            entry_ok = bool(g_thu and g_rth and valid and body_ok and vol_ok and (long_ok or short_ok))
+
+                            bv = ("nan" if body != body else "{:.3f}".format(body))
+                            vv = ("nan" if volr != volr else "{:.3f}".format(volr))
+                            rv = ("nan" if rsi  != rsi  else "{:.2f}".format(rsi))
+                            av = ("nan" if atr  != atr  else "{:.2f}".format(atr))
+
+                            # 3 líneas, estilo Germany40
+                            log_line(
+                                logfile,
+                                "VIS | sigNY={ny} | THU {thu} | RTH {rth} | VALID {val} | BODY {b}({bv}>={bmin}) | VOL {v}({vv}>={vmin}) | RSI {rv} | ATR {av}".format(
+                                    ny=sigNY,
+                                    thu=ok(g_thu), rth=ok(g_rth), val=ok(valid),
+                                    b=ok(body_ok), bv=bv, bmin="{:.2f}".format(BODY_MIN),
+                                    v=ok(vol_ok),  vv=vv, vmin="{:.2f}".format(VOL_REL_MIN),
+                                    rv=rv, av=av,
+                                )
+                            )
+                            log_line(logfile, "LONG={L} SHORT={S} | bear3={b3} bull3={u3} |".format(
+                                L=ok(long_ok), S=ok(short_ok), b3=bear3, u3=bull3
+                            ))
+                            log_line(logfile, "ENTRY {E}".format(E=ok(entry_ok)))
+                except Exception as _e:
+                    log_line(logfile, "VIS_ERR_SP500: {}".format(repr(_e)))
+
+                # VIS_SP500_PRE_RTH_END
+                if once:
+                    return
+                time.sleep(poll)
+                continue
+
+            # 3) NO_TRADE_HOURS Berlin {9,14,15}
+            no_trade_hours = (cfg.get("strategy") or {}).get("no_trade_hours_berlin") \
+                             or (cfg.get("schedule") or {}).get("no_trade_hours_berlin") \
+                             or [9, 14, 15]
+            try:
+                now_local = now.tz_convert(tz_name)
+                if int(now_local.hour) in set(int(x) for x in no_trade_hours):
+                    log_line(logfile, f"GATE: NO_TRADE_HOURS Berlin hour={now_local.hour} blocked")
+                    if once:
+                        return
+                    time.sleep(poll)
+                    continue
+            except Exception:
+                pass
+
+            # 8) Circuit breaker (solo bloquea si flat)
+            cooldown_until = _as_ts(st.get("cooldown_until_iso"))
+            if cooldown_until and now < cooldown_until:
+                log_line(logfile, f"GATE: circuit breaker cooldown until {cooldown_until.isoformat()}")
+                if once:
+                    return
+                time.sleep(poll)
+                continue
+
+            # =======================
+            # 2) Señal en vela cerrada
+            # =======================
+            px = client.get_prices(epic, resolution, max_points=max(warmup, 200))
+            df = prices_to_df(px)
+            if df is None or df.empty or len(df) < 3:
+                log_line(logfile, "WARN: no prices returned")
+                if once:
+                    return
+                time.sleep(poll)
+                continue
+
+            df = strat.enrich(df, strat_params)
+            sig = strat.signal_on_bar_close(df, strat_params)
+
+            # VIS_ALWAYS_3LINES_GERMANY40_V1_START
+            try:
+                # Solo Germany40
+                if str(locals().get("bot_id", "")) == "germany40_5m_vwap":
+                    OK = "\u2705"
+                    NO = "\u274c"
+                    def ok(x): return OK if x else NO
+
+                    import math
+
+                    _row = df.iloc[-2] if len(df) >= 2 else df.iloc[-1]
+
+                    o = float(_row.get("open", float("nan")))
+                    c = float(_row.get("close", float("nan")))
+                    body = float(_row.get("body_ratio", float("nan")))
+                    volr = float(_row.get("vol_rel", float("nan")))
+                    rsi  = float(_row.get("rsi14", float("nan")))
+                    atr  = float(_row.get("atr14", float("nan")))
+                    vwap = float(_row.get("vwap", float("nan")))
+                    bear3 = _row.get("bear_prev3", None)
+                    bull3 = _row.get("bull_prev3", None)
+
+                    p_ = (strat_params or {})
+                    BODY_MIN      = float(p_.get("BODY_MIN", 0.70))
+                    VOL_REL_MIN   = float(p_.get("VOL_REL_MIN", 0.70))
+                    RSI_LONG_MAX  = float(p_.get("RSI_LONG_MAX", 75.0))
+                    RSI_SHORT_MIN = float(p_.get("RSI_SHORT_MIN", 40.0))
+                    BEAR3_LONG    = float(p_.get("BEAR_PREV3_LONG", 2))
+                    BULL3_SHORT   = float(p_.get("BULL_PREV3_SHORT", 2))
+                    VWAP_K        = float(p_.get("VWAP_DISTANCE_K", 0.20))
+
+                    def _isnum(x):
+                        try:
+                            return (x == x) and (not math.isinf(x))
+                        except Exception:
+                            return False
+
+                    # Gates (siempre calculados aquí)
+                    g_thu = not (disable_thursday_utc and now.weekday() == 3)
+                    g_rth = (not rth_enabled) or _rth_is_open(rth, now)
+
+                    nth_ok = True
+                    try:
+                        _nl = now.tz_convert(tz_name)
+                        _nth = locals().get("no_trade_hours", [9, 14, 15])
+                        nth_ok = int(_nl.hour) not in set(int(x) for x in _nth)
+                    except Exception:
+                        pass
+
+                    valid = (
+                        _isnum(o) and _isnum(c) and _isnum(body) and _isnum(volr) and _isnum(rsi) and _isnum(atr) and _isnum(vwap)
+                        and (bear3 is not None) and (bull3 is not None)
+                    )
+
+                    body_ok = bool(valid and body >= BODY_MIN)
+                    vol_ok  = bool(valid and volr >= VOL_REL_MIN)
+
+                    dist = float("nan")
+                    dist_ok = False
+                    if valid:
+                        dist = abs(c - vwap)
+                        dist_ok = bool(dist >= (VWAP_K * atr))
+
+                    long_ok = bool(
+                        valid and dist_ok and (c > vwap) and (c > o) and (float(bear3) >= BEAR3_LONG) and (rsi <= RSI_LONG_MAX)
+                    )
+                    short_ok = bool(
+                        valid and dist_ok and (c < vwap) and (c < o) and (float(bull3) >= BULL3_SHORT) and (rsi >= RSI_SHORT_MIN)
+                    )
+
+                    entry_ok = bool(g_thu and g_rth and nth_ok and valid and body_ok and vol_ok and (long_ok or short_ok))
+
+                    bv = ("nan" if body != body else "{:.3f}".format(body))
+                    vv = ("nan" if volr != volr else "{:.3f}".format(volr))
+                    dv = ("nan" if dist != dist else "{:.2f}".format(dist))
+                    av = ("nan" if atr  != atr  else "{:.2f}".format(atr))
+
+                    log_line(
+                        logfile,
+                        "VIS | THU {thu} | RTH {rth} | VALID {val} | BODY {b}({bv}<={bmin}) | VOL {v}({vv}<={vmin}) | DIST {d}({dv}>={k}*{av}) | NTH {nth}".format(
+                            thu=ok(g_thu), rth=ok(g_rth), val=ok(valid),
+                            b=ok(body_ok), bv=bv, bmin="{:.2f}".format(BODY_MIN),
+                            v=ok(vol_ok),  vv=vv, vmin="{:.2f}".format(VOL_REL_MIN),
+                            d=ok(dist_ok), dv=dv, k="{:.2f}".format(VWAP_K), av=av,
+                            nth=ok(nth_ok),
+                        )
+                    )
+                    log_line(logfile, "LONG={L} SHORT={S} |".format(L=ok(long_ok), S=ok(short_ok)))
+                    log_line(logfile, "ENTRY {E}".format(E=ok(entry_ok)))
+            except Exception as _e:
+                log_line(logfile, "VIS_ERR_ALWAYS: {}".format(repr(_e)))
+            # VIS_ALWAYS_3LINES_GERMANY40_V1_END
+
+            # VIS_ALWAYS_3LINES_SP500_V1_START
+            try:
+                # Solo SP500
+                if str(locals().get("bot_id", "")) == "sp500_5m":
+                    OK = "✅"
+                    NO = "❌"
+                    def ok(x): return OK if x else NO
+
+                    import math
+
+                    # MISMO patrón que Germany40: usa df ya calculado arriba
+                    _row = df.iloc[-2] if len(df) >= 2 else df.iloc[-1]
+                    _ts_utc = df.index[-2] if len(df) >= 2 else df.index[-1]
+                    _ts_ny = _ts_utc.tz_convert("America/New_York")
+
+                    o = float(_row.get("open", float("nan")))
+                    c = float(_row.get("close", float("nan")))
+                    body = float(_row.get("body_ratio", float("nan")))
+                    volr = float(_row.get("vol_rel", float("nan")))
+                    rsi  = float(_row.get("rsi14", float("nan")))
+                    atr  = float(_row.get("atr14", float("nan")))
+                    rng  = float(_row.get("range", float("nan")))
+                    bear3 = _row.get("bear_prev3", None)
+                    bull3 = _row.get("bull_prev3", None)
+
+                    # thresholds (misma spec que us500_5m_sma_spec.py)
+                    BODY_MIN      = 0.70
+                    VOL_REL_MIN   = 0.70
+                    RSI_LONG_MAX  = 75.0
+                    RSI_SHORT_MIN = 40.0
+                    BEAR3_LONG    = 2
+                    BULL3_SHORT   = 2
+
+                    def _isnum(x):
+                        try:
+                            return (x == x) and (not math.isinf(x))
+                        except Exception:
+                            return False
+
+                    # Gates según la VELA señal (como spec)
+                    hhmm = (_ts_ny.hour, _ts_ny.minute)
+                    g_rth = (hhmm >= (9,30)) and (hhmm <= (16,0))
+                    g_thu = not (_ts_utc.weekday() == 3)  # no jueves UTC
+
+                    valid = (
+                        _isnum(o) and _isnum(c) and _isnum(body) and _isnum(volr) and _isnum(rsi) and _isnum(atr) and _isnum(rng)
+                        and (bear3 is not None) and (bull3 is not None)
+                        and (rng > 0)
+                    )
+
+                    body_ok = bool(valid and body >= BODY_MIN)
+                    vol_ok  = bool(valid and volr >= VOL_REL_MIN)
+
+                    long_ok  = bool(valid and (c > o) and (float(bear3) >= BEAR3_LONG) and (rsi < RSI_LONG_MAX))
+                    short_ok = bool(valid and (c < o) and (float(bull3) >= BULL3_SHORT) and (rsi > RSI_SHORT_MIN))
+
+                    entry_ok = bool(g_thu and g_rth and valid and body_ok and vol_ok and (long_ok or short_ok))
+
+                    bv = ("nan" if body != body else "{:.3f}".format(body))
+                    vv = ("nan" if volr != volr else "{:.3f}".format(volr))
+                    rv = ("nan" if rsi  != rsi  else "{:.2f}".format(rsi))
+                    av = ("nan" if atr  != atr  else "{:.2f}".format(atr))
+
+                    # 3 líneas + ✅/❌ (igual que Germany40)
+                    log_line(
+                        logfile,
+                        "VIS | THU {thu} | RTH {rth} | VALID {val} | BODY {b}({bv}>={bmin}) | VOL {v}({vv}>={vmin}) | RSI {rv} | ATR {av}".format(
+                            thu=ok(g_thu), rth=ok(g_rth), val=ok(valid),
+                            b=ok(body_ok), bv=bv, bmin="{:.2f}".format(BODY_MIN),
+                            v=ok(vol_ok),  vv=vv, vmin="{:.2f}".format(VOL_REL_MIN),
+                            rv=rv, av=av,
+                        )
+                    )
+                    log_line(logfile, "LONG={L} SHORT={S} |".format(L=ok(long_ok), S=ok(short_ok)))
+                    log_line(logfile, "ENTRY {E}".format(E=ok(entry_ok)))
+            except Exception as _e:
+                log_line(logfile, "VIS_ERR_ALWAYS_SP500: {}".format(repr(_e)))
+
+            # VIS_ALWAYS_3LINES_SP500_V1_END
+
+            if sig is None:
+                if once:
+                    return
+                time.sleep(poll)
+                continue
+
+            # evitar duplicar por la misma vela señal
+            signal_bar_time = df.index[-2]
+            if last_closed_time and signal_bar_time <= last_closed_time:
+                if once:
+                    return
+                time.sleep(poll)
+                continue
+
+            last_closed_time = signal_bar_time
+            st["last_closed_time"] = signal_bar_time.isoformat()
+            save_state(st)
+
+            # =======================
+            # 6) Sizing + 7) niveles
+            # =======================
+            entry_price = float(df["open"].iloc[-1])        # open del entry_bar (siguiente)
+            entry_time = df.index[-1]                       # timestamp entry_bar
+            atr_signal = float(df["atr14"].iloc[-2])        # ATR de la vela señal
+
+            init = strat.initial_risk(entry_price, atr_signal, sig, strat_params)
+            r_points = float(init["r_points"])
+            sl_local = float(init["sl_local"])
+            tp_local = float(init["tp_local"])
+            tp_r_multiple = float(init.get("tp_r_multiple", 3.0))
+
+            size = calc_position_size(
+                bot_equity=bot_equity,
+                risk_pct=risk_pct,
+                r_points=r_points,
+                value_per_point_per_size=vpp,
+            )
+
+            # =======================
+            # 5) Open mercado
+            # =======================
+            log_line(logfile, f"SIGNAL {sig.direction} entry_open={entry_price:.2f} size={size} R={r_points:.2f} TP({tp_r_multiple}R)={tp_local:.2f}")
+            resp = client.open_market(epic, sig.direction, size)
+            email_event(email_enabled, bot_id, "TRADE_OPEN", {
+                "epic": epic,
+                "direction": sig.direction,
+                "size": size,
+                "open_resp": resp,
+                "account_id": account_id,
+            }, logfile)
+
+            deal_ref = (resp or {}).get("dealReference") or (resp or {}).get("deal_reference")
+            if not deal_ref:
+                log_line(logfile, f"ENTRY ERROR no dealReference resp={str(resp)[:250]}")
+                if once:
+                    return
+                time.sleep(poll)
+                continue
+
+            conf = client.confirm(str(deal_ref), timeout_sec=30) or {}
+            deal_id = pick_position_dealid_from_confirm(conf)
+            if not deal_id:
+                log_line(logfile, f"ENTRY ERROR no dealId confirm={str(conf)[:250]}")
+                if once:
+                    return
+                time.sleep(poll)
+                continue
+
+            planned_exit = entry_time + pd.Timedelta(minutes=exit_bars * bar_minutes)
+
+            st["pos"] = {
+                "deal_id": str(deal_id),
+                "direction": sig.direction,
+                "size": float(size),
+                "entry_time_iso": entry_time.isoformat(),
+                "entry_price_est": float(entry_price),
+                "entry_price_api": (conf or {}).get("level"),
+                "r_points": float(r_points),
+                "sl_local": float(sl_local),
+                "tp_local": float(tp_local),
+                "planned_exit_iso": planned_exit.isoformat(),
+                "trail_1r_done": False,
+                "trail_2r_done": False,
+                "meta": sig.meta,
+            }
+            save_state(st)
+
+            email_event(email_enabled, bot_id, "ENTRY_OPENED", {
+                "deal_id": str(deal_id),
+                "direction": sig.direction,
+                "size": size,
+                "entry_price": entry_price,
+                "sl_local": sl_local,
+                "tp_local": tp_local,
+                "planned_exit": planned_exit.isoformat(),
+            }, logfile)
+
+            if once:
+                return
+            time.sleep(poll)
+
+    finally:
+        try:
+            lock.release()
+        except Exception:
+            pass

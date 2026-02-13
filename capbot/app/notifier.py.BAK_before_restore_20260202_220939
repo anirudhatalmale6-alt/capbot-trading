@@ -1,0 +1,118 @@
+from __future__ import annotations
+
+import os
+import socket
+import smtplib
+import inspect
+from typing import Dict, Any, Optional, Tuple
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+
+import capbot.notify.email_templates as tmpl
+
+
+def _safe_get(d: Dict[str, Any], *keys, default=None):
+    cur = d
+    for k in keys:
+        if not isinstance(cur, dict) or k not in cur:
+            return default
+        cur = cur[k]
+    return cur
+
+
+def _env(name: str, default: str = "") -> str:
+    v = os.getenv(name)
+    return default if v is None else str(v)
+
+
+def _send_smtp(subj: str, text_body: str, html_body: str, cfg: Optional[Dict[str, Any]] = None) -> None:
+    cfg = cfg or {}
+
+    host = _env("SMTP_HOST") or _safe_get(cfg, "smtp", "host", default="")
+    port = int(_env("SMTP_PORT") or _safe_get(cfg, "smtp", "port", default=587) or 587)
+    user = _env("SMTP_USER") or _safe_get(cfg, "smtp", "user", default="")
+    pwd  = _env("SMTP_PASS") or _safe_get(cfg, "smtp", "pass", default="")
+
+    mail_to   = _env("EMAIL_TO") or _safe_get(cfg, "email", "to", default="")
+    mail_from = _env("EMAIL_FROM") or _safe_get(cfg, "email", "from", default=user)
+
+    if not (host and mail_to and mail_from):
+        raise RuntimeError(f"SMTP not configured (host/to/from). host={host!r} to={mail_to!r} from={mail_from!r}")
+
+    msg = MIMEMultipart("alternative")
+    msg["Subject"] = subj
+    msg["From"] = mail_from
+    msg["To"] = mail_to
+
+    msg.attach(MIMEText(text_body or "", "plain", "utf-8"))
+    msg.attach(MIMEText(html_body or "", "html", "utf-8"))
+
+    with smtplib.SMTP(host, port, timeout=20) as s:
+        s.ehlo()
+        try:
+            s.starttls()
+            s.ehlo()
+        except Exception:
+            pass
+
+        if user and pwd:
+            s.login(user, pwd)
+
+        s.sendmail(mail_from, [mail_to], msg.as_string())
+
+
+def _render_email_compat(event: str, bot_id: str, payload: Dict[str, Any], meta: Dict[str, Any]) -> Tuple[str, str]:
+    """
+    Compat: soporta render_email(event, bot_id, payload, meta)
+    (y si algún día cambia, lo detecta por aridad).
+    """
+    fn = tmpl.render_email
+    n = len(inspect.signature(fn).parameters)
+    if n >= 4:
+        return fn(event, bot_id, payload, meta)  # type: ignore[misc]
+    if n == 3:
+        return fn(event, payload, meta)  # type: ignore[misc]
+    return fn(event, bot_id, payload)  # type: ignore[misc]
+
+
+def _subject_compat(event: str, payload: Dict[str, Any], meta: Dict[str, Any]) -> str:
+    fn = tmpl.subject
+    n = len(inspect.signature(fn).parameters)
+    if n >= 3:
+        return fn(event, payload, meta)  # type: ignore[misc]
+    return fn(event, payload)  # type: ignore[misc]
+
+def _fmt(x, nd=2):
+    try:
+        return f"{float(x):.{nd}f}"
+    except Exception:
+        return str(x)
+
+def _enrich_email(event: str, payload: Dict[str, Any], meta: Dict[str, Any], subj: str, text_body: str, html_body: str):
+
+    try:
+        _send_smtp(subj, text_body, html_body, cfg=cfg)
+        print(f"EMAIL OK subject=[{subj}]")
+    except Exception as e:
+        try:
+            print(f"EMAIL_ERR: {repr(e)} subject=[{subj}]")
+        except Exception:
+            pass
+
+def email_startup(enabled: bool, bot_id: str, cfg: Dict[str, Any], logfile: str = "") -> None:
+    """
+    Email de arranque del bot (bonito HTML) usando la misma plantilla.
+    """
+    if not enabled:
+        return
+
+    data = {
+        "event": "STARTED",
+        "bot_id": bot_id,
+        "market": (cfg.get("market") or cfg.get("symbol") or "Germany 40"),
+        "timeframe": (cfg.get("timeframe") or cfg.get("resolution") or "5m"),
+        "strategy": ((cfg.get("strategy") or {}).get("module") or ""),
+        "config_path": cfg.get("_config_path") or cfg.get("config_path") or "",
+        "logfile": logfile or "",
+    }
+    email_event(True, bot_id, "STARTED", data, logfile=logfile, cfg=cfg)

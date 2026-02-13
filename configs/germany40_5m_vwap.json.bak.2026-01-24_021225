@@ -1,0 +1,54 @@
+{
+  "bot_id": "germany40_5m_vwap",
+  "poll_seconds": 30,
+  "http_timeout": 30,
+  "account": {
+    "account_id": "${CAPITAL_ACCOUNT_ID}"
+  },
+  "market": {
+    "epic": "DE40",
+    "resolution": "MINUTE_5",
+    "warmup_bars": 600
+  },
+"schedule": {
+  "timezone": "Europe/Berlin",
+  "rth_start": "09:30",
+  "rth_end": "17:30",
+  "rth_enabled": true,
+  "disable_thursday_utc": false
+  },
+  "strategy": {
+    "module": "capbot.strategies.vwap_pullback_rsi:VWAPPullbackRSI",
+    "params": {
+      "BODY_MIN": 0.7,
+      "VOL_REL_MIN": 0.7,
+      "VOL_WINDOW": 20,
+      "RSI_PERIOD": 14,
+      "RSI_LONG_MAX": 75,
+      "RSI_SHORT_MIN": 40,
+      "BEAR_PREV3_LONG": 2,
+      "BULL_PREV3_SHORT": 2,
+      "ATR_PERIOD": 14,
+      "SL_ATR": 1.0,
+      "TP_R_MULTIPLE": 3.0,
+      "VWAP_TZ": "Europe/Berlin"
+    }
+  },
+  "risk": {
+    "bot_equity": 25000,
+    "risk_pct": 0.02,
+    "value_per_point_per_size": 1.0,
+    "exit_bars": 24
+  },
+  "trailing": {
+    "enabled": true,
+    "buffer_r": 0.1
+  },
+  "circuit_breaker": {
+    "losses": 3,
+    "cooldown_min": 60
+  },
+  "notifications": {
+    "email_enabled": true
+  }
+}

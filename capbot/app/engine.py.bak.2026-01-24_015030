@@ -1,0 +1,390 @@
+import os
+import time
+from typing import Any, Dict, Optional
+
+import pandas as pd
+
+from capbot.app.notifier import email_event, email_startup
+from capbot.broker.capital_client import (
+    CapitalClient,
+    is_deal_open,
+    pick_position_dealid_from_confirm,
+)
+from capbot.data.prices import prices_to_df
+from capbot.domain.lock import InstanceLock
+from capbot.domain.logger import log_line
+from capbot.domain.paths import bot_paths
+from capbot.domain.risk import calc_position_size
+from capbot.domain.schedule import RTH
+from capbot.domain.state_store import load_state, save_state_atomic
+from capbot.domain.trade_log import append_row, ensure_header
+from capbot.domain.trailing import maybe_trail_option_a
+from capbot.strategies.loader import load_strategy
+
+
+def utc_now() -> pd.Timestamp:
+    return pd.Timestamp.now(tz="UTC")
+
+
+def _as_ts(x: Optional[str]) -> Optional[pd.Timestamp]:
+    if not x:
+        return None
+    try:
+        return pd.to_datetime(x, utc=True)
+    except Exception:
+        return None
+
+
+def _resolution_to_minutes(resolution: str) -> int:
+    """Map Capital.com resolution strings to bar length in minutes."""
+    r = (resolution or "").upper().strip()
+    if r.startswith("MINUTE_"):
+        try:
+            return int(r.split("_", 1)[1])
+        except Exception:
+            return 5
+    if r in ("HOUR", "HOUR_1"):
+        return 60
+    if r == "HOUR_4":
+        return 240
+    if r == "DAY":
+        return 1440
+    return 5
+
+
+def run_bot(cfg: Dict[str, Any], once: bool = False):
+    # stable bot_id (used for file names and logs)
+    bot_id = str(cfg.get("bot_id") or (cfg.get("market") or {}).get("epic") or "capbot")
+
+    # bot_paths in this pack returns a 4-tuple:
+    # (state_path, trades_csv, logfile, lockfile)
+    state_path, csv_path, logfile, lock_path = bot_paths(bot_id)
+
+# lock (compat: algunas versiones no aceptan stale_seconds)
+    try:
+        lock = InstanceLock(lock_path, 1800)   # 30min stale si tu clase lo soporta como posicional
+    except TypeError:
+        lock = InstanceLock(lock_path)         # fallback si no soporta stale
+
+    try:
+        lock.acquire()
+        ensure_header(csv_path)
+
+        st = load_state(state_path) or {}
+
+        poll = int(cfg.get("poll_seconds", 30))
+
+        # Schedule
+        schedule_cfg = cfg.get("schedule") or {}
+        rth_enabled = bool(schedule_cfg.get("rth_enabled", True))
+        disable_thursday_utc = bool(schedule_cfg.get("disable_thursday_utc", False))
+
+        rth_start = str(schedule_cfg.get("rth_start", "09:30"))
+        rth_end = str(schedule_cfg.get("rth_end", "17:30"))
+        rth = RTH(
+            tz_name=schedule_cfg.get("timezone", "Europe/Berlin"),
+            start_hh=int(rth_start.split(":")[0]),
+            start_mm=int(rth_start.split(":")[1]),
+            end_hh=int(rth_end.split(":")[0]),
+            end_mm=int(rth_end.split(":")[1]),
+        )
+
+        bar_minutes = _resolution_to_minutes(resolution)
+
+        # Risk
+        risk_cfg = cfg.get("risk") or {}
+        bot_equity = float(risk_cfg.get("bot_equity", 25000.0))
+        risk_pct = float(risk_cfg.get("risk_pct", 0.02))
+        vpp = float(risk_cfg.get("value_per_point_per_size", 1.0))
+        exit_bars = int(risk_cfg.get("exit_bars", 24))
+
+        # Trailing
+        trailing_cfg = cfg.get("trailing") or {}
+        trailing_on = bool(trailing_cfg.get("enabled", True))
+        trail_buffer_r = float(trailing_cfg.get("buffer_r", 0.10))
+
+        # Circuit breaker
+        cb_cfg = cfg.get("circuit_breaker") or {}
+        cb_losses = int(cb_cfg.get("losses", 3))
+        cb_cooldown = int(cb_cfg.get("cooldown_min", 60))
+
+        # Notifications
+        notif_cfg = cfg.get("notifications") or {}
+        email_enabled = bool(notif_cfg.get("email_enabled", True))
+
+        # Strategy
+        strategy_cfg = cfg.get("strategy") or {}
+        strat = load_strategy(strategy_cfg.get("module"))
+        strat_params = strategy_cfg.get("params") or {}
+
+        # Account selection: per-bot (config or env)
+        account_cfg = cfg.get("account") or {}
+        account_id = account_cfg.get("account_id") or os.environ.get("CAPITAL_ACCOUNT_ID")
+
+        last_closed_time = _as_ts(st.get("last_closed_time"))
+
+        def save():
+            save_state_atomic(state_path, st)
+
+        client = CapitalClient()
+        email_startup(email_enabled, bot_id, logfile)
+
+        while True:
+            now = utc_now()
+
+            # Ensure session + correct account (best effort)
+            client.login()
+            client.ensure_account(account_id)
+
+            # Read current state
+            pos = st.get("pos") or {}
+            deal_id = pos.get("deal_id")
+            in_position = bool(deal_id)
+
+            # --- If in position: manage exits first ---
+            if in_position:
+                # Fetch prices for management
+                px = client.get_prices(epic, resolution, max_points=max(warmup, 200))
+                df = prices_to_df(px)
+                if df is None or df.empty:
+                    log_line(logfile, "WARN: no prices returned")
+                    if once:
+                        return
+                    time.sleep(poll)
+                    continue
+
+                live_px = float(df["close"].iloc[-1])
+
+                # Outside RTH auto-exit (only if enabled)
+                if rth_enabled and (not rth.is_open(now)):
+                    log_line(logfile, f"EXIT outside RTH live={live_px:.2f}")
+                    conf = client.close_position(str(deal_id))
+                    append_row(csv_path, now.isoformat(), bot_id, epic, pos.get("direction"), pos.get("size"), "EXIT_RTH", live_px, conf)
+                    st["pos"] = {}
+                    st["last_closed_time"] = now.isoformat()
+                    st["consec_losses"] = 0  # we will reconcile later if needed
+                    save()
+                    email_event(email_enabled, bot_id, "EXIT_RTH", {"deal_id": deal_id, "price": live_px}, logfile)
+                    if once:
+                        return
+                    time.sleep(poll)
+                    continue
+
+                # Time exit
+                planned_exit = _as_ts(pos.get("planned_exit_iso"))
+                if planned_exit and now >= planned_exit:
+                    log_line(logfile, f"EXIT time-exit live={live_px:.2f}")
+                    conf = client.close_position(str(deal_id))
+                    append_row(csv_path, now.isoformat(), bot_id, epic, pos.get("direction"), pos.get("size"), "EXIT_TIME", live_px, conf)
+                    st["pos"] = {}
+                    st["last_closed_time"] = now.isoformat()
+                    save()
+                    email_event(email_enabled, bot_id, "EXIT_TIME", {"deal_id": deal_id, "price": live_px}, logfile)
+                    if once:
+                        return
+                    time.sleep(poll)
+                    continue
+
+                # Local SL/TP
+                sl_local = float(pos.get("sl_local"))
+                tp_local = float(pos.get("tp_local"))
+                direction = str(pos.get("direction")).upper()
+
+                hit_sl = (direction == "BUY" and live_px <= sl_local) or (direction == "SELL" and live_px >= sl_local)
+                hit_tp = (direction == "BUY" and live_px >= tp_local) or (direction == "SELL" and live_px <= tp_local)
+
+                if hit_sl or hit_tp:
+                    reason = "EXIT_SL" if hit_sl else "EXIT_TP"
+                    log_line(logfile, f"{reason} live={live_px:.2f} SL={sl_local:.2f} TP={tp_local:.2f}")
+                    conf = client.close_position(str(deal_id))
+                    append_row(csv_path, now.isoformat(), bot_id, epic, direction, pos.get("size"), reason, live_px, conf)
+                    st["pos"] = {}
+                    st["last_closed_time"] = now.isoformat()
+                    save()
+                    email_event(email_enabled, bot_id, reason, {"deal_id": deal_id, "price": live_px}, logfile)
+
+                    # Circuit breaker update (best-effort from confirm, may be missing)
+                    try:
+                        profit = None
+                        if isinstance(conf, dict):
+                            profit = conf.get("profit")
+                        if profit is not None:
+                            consec = int(st.get("consec_losses", 0))
+                            if float(profit) < 0:
+                                consec += 1
+                            else:
+                                consec = 0
+                            st["consec_losses"] = consec
+                            if consec >= cb_losses:
+                                st["cooldown_until_iso"] = (now + pd.Timedelta(minutes=cb_cooldown)).isoformat()
+                            save()
+                    except Exception:
+                        pass
+
+                    if once:
+                        return
+                    time.sleep(poll)
+                    continue
+
+                # Trailing Option A (+1R / +2R) (only moves SL tighter)
+                if trailing_on:
+                    try:
+                        moved, new_sl, flags = maybe_trail_option_a(
+                            direction=direction,
+                            entry=float(pos.get("entry_price_est")),
+                            live=float(live_px),
+                            r_points=float(pos.get("r_points")),
+                            current_sl=float(pos.get("sl_local")),
+                            trail_1r_done=bool(pos.get("trail_1r_done")),
+                            trail_2r_done=bool(pos.get("trail_2r_done")),
+                            buffer_r=float(trail_buffer_r),
+                        )
+                        if moved:
+                            pos["sl_local"] = float(new_sl)
+                            pos["trail_1r_done"] = bool(flags.get("trail_1r_done"))
+                            pos["trail_2r_done"] = bool(flags.get("trail_2r_done"))
+                            st["pos"] = pos
+                            save()
+                            log_line(logfile, f"TRAIL moved SL -> {new_sl:.2f}")
+                            email_event(email_enabled, bot_id, "TRAIL_SL", {"deal_id": deal_id, "sl_local": new_sl}, logfile)
+                    except Exception as e:
+                        log_line(logfile, f"TRAIL warning: {repr(e)}")
+
+                if once:
+                    return
+                time.sleep(poll)
+                continue
+
+            # --- Not in position: entry logic ---
+            # Thursday UTC gate (only blocks entries)
+            if disable_thursday_utc and now.weekday() == 3:
+                log_line(logfile, "GATE: Thursday UTC disabled (entries blocked)")
+                if once:
+                    return
+                time.sleep(poll)
+                continue
+
+            # RTH gate (only if enabled)
+            if rth_enabled and (not rth.is_open(now)):
+                log_line(logfile, f"GATE: outside RTH ({rth_start}-{rth_end} {schedule_cfg.get('timezone','')})")
+                if once:
+                    return
+                time.sleep(poll)
+                continue
+
+            # Circuit breaker gate
+            cooldown_until = _as_ts(st.get("cooldown_until_iso"))
+            if cooldown_until and now < cooldown_until:
+                log_line(logfile, f"GATE: circuit breaker cooldown until {cooldown_until.isoformat()}")
+                if once:
+                    return
+                time.sleep(poll)
+                continue
+
+            # Get prices and compute strategy signal on closed bar
+            px = client.get_prices(epic, resolution, max_points=max(warmup, 200))
+            df = prices_to_df(px)
+            if df is None or df.empty:
+                log_line(logfile, "WARN: no prices returned")
+                if once:
+                    return
+                time.sleep(poll)
+                continue
+
+            df = strat.enrich(df, strat_params)
+            sig = strat.signal_on_bar_close(df, strat_params)
+
+            if sig is None:
+                if once:
+                    return
+                time.sleep(poll)
+                continue
+
+            closed_t = df.index[-2]
+            if last_closed_time and closed_t <= last_closed_time:
+                if once:
+                    return
+                time.sleep(poll)
+                continue
+
+            last_closed_time = closed_t
+            st["last_closed_time"] = closed_t.isoformat()
+            save()
+
+            # Position sizing
+            entry = float(df["close"].iloc[-2])
+            atr_v = float(df["atr14"].iloc[-2])
+            init = strat.initial_risk(entry, atr_v, sig, strat_params)
+
+            r_points = float(init["r_points"])
+            sl_local = float(init["sl_local"])
+            tp_local = float(init["tp_local"])
+            tp_r_multiple = float(init.get("tp_r_multiple", 3.0))
+
+            size = calc_position_size(
+                bot_equity=bot_equity,
+                risk_pct=risk_pct,
+                r_points=r_points,
+                value_per_point_per_size=vpp,
+            )
+
+            # Open
+            log_line(logfile, f"SIGNAL {sig.direction} @ {entry:.2f} size={size} R={r_points:.2f} TP({tp_r_multiple}R)={tp_local:.2f}")
+            resp = client.open_market(epic, sig.direction, size)
+            deal_ref = (resp or {}).get("dealReference")
+            if not deal_ref:
+                log_line(logfile, f"ENTRY ERROR no dealReference resp={str(resp)[:250]}")
+                if once:
+                    return
+                time.sleep(poll)
+                continue
+
+            conf = client.confirm(str(deal_ref), timeout_sec=30) or {}
+            deal_id = pick_position_dealid_from_confirm(conf)
+            if not deal_id:
+                log_line(logfile, f"ENTRY ERROR no dealId confirm={str(conf)[:250]}")
+                if once:
+                    return
+                time.sleep(poll)
+                continue
+
+            entry_api = (conf or {}).get("level")
+            planned_exit = now + pd.Timedelta(minutes=exit_bars * bar_minutes)
+
+            st["pos"] = {
+                "deal_id": str(deal_id),
+                "direction": sig.direction,
+                "size": float(size),
+                "entry_time_iso": closed_t.isoformat(),
+                "entry_price_est": float(entry),
+                "entry_price_api": entry_api,
+                "initial_sl": float(sl_local),
+                "r_points": float(r_points),
+                "sl_local": float(sl_local),
+                "tp_local": float(tp_local),
+                "planned_exit_iso": planned_exit.isoformat(),
+                "trail_1r_done": False,
+                "trail_2r_done": False,
+                "meta": sig.meta,
+            }
+            save()
+
+            log_line(logfile, f"OPENED deal_id={deal_id} dir={sig.direction} size={size} SL={sl_local:.2f} TP={tp_local:.2f}")
+            email_event(email_enabled, bot_id, "ENTRY_OPENED", {
+                "deal_id": deal_id,
+                "direction": sig.direction,
+                "size": size,
+                "SL_local": f"{sl_local:.2f}",
+                "TP_local": f"{tp_local:.2f}",
+                "planned_exit": planned_exit.isoformat(),
+            }, logfile)
+
+            if once:
+                return
+            time.sleep(poll)
+
+    finally:
+        try:
+            lock.release()
+        except Exception:
+            pass

@@ -1,0 +1,64 @@
+from __future__ import annotations
+
+import json
+import logging
+from typing import Any, Dict
+
+log = logging.getLogger(__name__)
+
+def _j(obj: Any) -> str:
+    try:
+        return json.dumps(obj, indent=2, ensure_ascii=False, default=str)
+    except Exception:
+        return str(obj)
+
+def _smtp_send(subject: str, body: str) -> None:
+    import os, smtplib, ssl
+    from email.message import EmailMessage
+
+    to_addr = os.environ.get("EMAIL_TO") or os.environ.get("MAIL_TO")
+    from_addr = os.environ.get("EMAIL_FROM") or to_addr
+    host = os.environ.get("SMTP_HOST")
+    port = int(os.environ.get("SMTP_PORT", "587"))
+    user = os.environ.get("SMTP_USER")
+    pwd  = os.environ.get("SMTP_PASS")
+
+    if not to_addr or not host or not user or not pwd:
+        raise RuntimeError("Missing SMTP env vars (EMAIL_TO, SMTP_HOST, SMTP_USER, SMTP_PASS)")
+
+    msg = EmailMessage()
+    msg["To"] = to_addr
+    msg["From"] = from_addr
+    msg["Subject"] = subject
+    msg.set_content(body)
+
+    ctx = ssl.create_default_context()
+    with smtplib.SMTP(host, port, timeout=25) as s:
+        s.ehlo()
+        if port in (587, 25):
+            s.starttls(context=ctx)
+            s.ehlo()
+        s.login(user, pwd)
+        s.send_message(msg)
+
+def email_event(ok: bool, bot_id: str, event: str, payload: Any, *, logfile: str = "", cfg=None) -> None:
+    """
+    Sends an email for events (HEALTH / STARTUP / SIGNAL / etc).
+    Uses SMTP env vars (see germany40.secrets).
+    """
+    status = "OK ✅" if ok else "FAIL ❌"
+    subject = f"[capbot:{bot_id}] {event} {status}"
+
+    body: Dict[str, Any] = {
+        "ok": ok,
+        "bot_id": bot_id,
+        "event": event,
+        "payload": payload,
+        "logfile": logfile,
+    }
+
+    _smtp_send(subject, _j(body))
+    log.info("email_event sent bot_id=%s event=%s ok=%s", bot_id, event, ok)
+
+def email_startup(bot_id: str, payload: Any | None = None) -> None:
+    email_event(True, bot_id, "STARTUP", payload or {})

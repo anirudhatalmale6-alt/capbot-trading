@@ -1,0 +1,35 @@
+{
+  "bot_id": "btc_smoke",
+  "poll_seconds": 1,
+  "http_timeout": 30,
+  "account": {
+    "account_id": "${CAPITAL_ACCOUNT_ID}"
+  },
+  "market": {
+    "epic": "BTCUSD",
+    "resolution": "MINUTE_5",
+    "warmup_bars": 200
+  },
+  "schedule": {
+    "timezone": "Europe/Berlin",
+    "rth_enabled": false,
+    "disable_thursday_utc": false
+  },
+  "strategy": {
+    "module": "capbot.strategies.de40_vwap_k020:DE40VWAPK020",
+    "params": {
+      "DEBUG_CHECKS": true
+    },
+    "no_trade_hours_berlin": []
+  },
+  "notifications": {
+    "email_enabled": true
+  },
+  "startup_smoke_test": {
+    "enabled": true,
+    "direction": "BUY",
+    "size": 0.1,
+    "sleep_seconds": 5,
+    "force_demo_only": true
+  }
+}

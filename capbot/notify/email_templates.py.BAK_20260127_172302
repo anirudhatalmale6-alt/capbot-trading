@@ -1,0 +1,182 @@
+from __future__ import annotations
+from datetime import datetime, timezone
+from html import escape
+from zoneinfo import ZoneInfo
+import socket
+
+ICON = {
+    "STARTED": "🚀",
+    "HEALTH": "✅",
+    "ENTRY_OPENED": "🟢",
+    "EXIT_TP": "🎯",
+    "EXIT_SL": "🛑",
+    "EXIT_TIME": "⏱️",
+    "EXIT_RTH": "🌙",
+    "TRAIL_SL": "🧷",
+    "ERROR": "⚠️",
+}
+
+# Bot_id -> nombre “humano” (ajústalo a tu gusto)
+BOT_LABEL = {
+    "germany40_5m_vwap": "Germany 40 5m",
+    "sp500_5m_spec": "S&P 500 5m (Spec)",
+    "sp500_5m": "S&P 500 5m",
+}
+
+def _label(bot_id: str) -> str:
+    bot_id = (bot_id or "").strip()
+    return BOT_LABEL.get(bot_id, bot_id or "CapBot")
+
+def _engine_build() -> str:
+    try:
+        import capbot.app.engine as e
+        return getattr(e, "ENGINE_BUILD_TAG", "") or ""
+    except Exception:
+        return ""
+
+def _now_strings(tz_name: str):
+    now_utc = datetime.now(timezone.utc)
+    try:
+        now_local = now_utc.astimezone(ZoneInfo(tz_name))
+        local_s = now_local.strftime("%Y-%m-%d %H:%M:%S %Z")
+    except Exception:
+        local_s = "-"
+    return now_utc.strftime("%Y-%m-%d %H:%M:%SZ"), local_s
+
+def subject(bot_id: str, event: str, extra: str = "") -> str:
+    # Pedido tuyo: subject corto, “Germany 40 5m …”
+    base = _label(bot_id)
+    ico = ICON.get(event, "📣")
+    if extra:
+        return f"{base} {ico} {extra}"
+    return f"{base} {ico}"
+
+def _kv_table(rows: list[tuple[str,str]]) -> str:
+    trs = []
+    for k, v in rows:
+        trs.append(
+            f"<tr>"
+            f"<td style='padding:8px 10px;color:#667085;white-space:nowrap;border-top:1px solid #eaecf0;'>{escape(k)}</td>"
+            f"<td style='padding:8px 10px;border-top:1px solid #eaecf0;'>{escape(v)}</td>"
+            f"</tr>"
+        )
+    return "\n".join(trs)
+
+def render_email(event: str, bot_id: str, payload: dict, meta: dict | None = None) -> tuple[str, str]:
+    """
+    Returns (text_body, html_body)
+    meta recomendado (si existe): tz_name, service, host, last_line, ok(bool), status_text
+    """
+    meta = meta or {}
+    tz = str(meta.get("tz_name") or "Europe/Berlin")
+    ts_utc, ts_local = _now_strings(tz)
+    host = str(meta.get("host") or socket.gethostname())
+    build = str(meta.get("build") or _engine_build())
+    label = _label(bot_id)
+    ico = ICON.get(event, "📣")
+
+    ok = meta.get("ok")
+    if ok is None:
+        ok = True if event not in ("ERROR",) else False
+
+    badge_bg = "#e8f7ee" if ok else "#fdecec"
+    badge_fg = "#16794c" if ok else "#b42318"
+    status_txt = str(meta.get("status_text") or ("OK ✅" if ok else "NOT OK ❌"))
+
+    # Highlights “bonitos” arriba (sin tonterías)
+    p = payload or {}
+    direction = p.get("direction") or p.get("side") or p.get("dir")
+    deal_id = p.get("deal_id") or p.get("dealId") or p.get("id")
+
+    headline = f"{ico} {label} — {event}"
+
+    summary_bits = []
+    if direction:
+        summary_bits.append(f"Direction: {direction}")
+    if deal_id:
+        summary_bits.append(f"Deal: {deal_id}")
+
+    summary = " · ".join(summary_bits) if summary_bits else "Status update"
+
+    # Tabla principal (meta útil)
+    rows = [
+        ("Bot / Market", label),
+        ("Event", event),
+        ("Time (UTC / Local)", f"{ts_utc} / {ts_local}"),
+        ("Host", host),
+    ]
+    if meta.get("service"):
+        rows.append(("Service", str(meta["service"])))
+    if build:
+        rows.append(("Build", build))
+
+    # Payload (solo lo que hay) – ordenado
+    payload_rows = []
+    for k in sorted(p.keys()):
+        v = p.get(k)
+        if v is None:
+            continue
+        payload_rows.append((str(k), str(v)))
+
+    last_line = str(meta.get("last_line") or "")
+
+    html = f"""<!doctype html>
+<html>
+  <body style="margin:0;padding:0;background:#f6f7fb;font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Helvetica,Arial,sans-serif;">
+    <div style="max-width:720px;margin:0 auto;padding:20px;">
+      <div style="background:#ffffff;border:1px solid #eaecf0;border-radius:14px;overflow:hidden;">
+        <div style="padding:16px 18px;border-bottom:1px solid #eaecf0;display:flex;align-items:center;gap:10px;">
+          <div style="font-size:20px;line-height:20px;">{escape(ico)}</div>
+          <div style="flex:1;">
+            <div style="font-size:16px;font-weight:700;color:#101828;">{escape(headline)}</div>
+            <div style="font-size:12px;color:#667085;margin-top:2px;">{escape(summary)}</div>
+          </div>
+          <div style="padding:6px 10px;border-radius:999px;background:{badge_bg};color:{badge_fg};font-weight:700;font-size:12px;">
+            {escape(status_txt)}
+          </div>
+        </div>
+
+        <div style="padding:14px 18px;">
+          <table style="width:100%;border-collapse:collapse;font-size:13px;color:#101828;">
+            {_kv_table(rows)}
+          </table>
+
+          {"<div style='margin-top:14px;font-weight:700;color:#101828;font-size:13px;'>Details</div>" if payload_rows else ""}
+          {"<table style='width:100%;border-collapse:collapse;font-size:13px;color:#101828;margin-top:6px;'>" + _kv_table(payload_rows) + "</table>" if payload_rows else ""}
+
+          {f"""
+          <div style="margin-top:14px;padding:12px 12px;border:1px solid #eaecf0;border-radius:12px;background:#fbfcfe;">
+            <div style="font-size:12px;color:#667085;margin-bottom:6px;">Last log line</div>
+            <div style="font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;font-size:12px;white-space:pre-wrap;color:#101828;">{escape(last_line)}</div>
+          </div>
+          """ if last_line else ""}
+
+        </div>
+      </div>
+    </div>
+  </body>
+</html>
+"""
+
+    # Texto fallback
+    lines = []
+    lines.append(f"{label} — {event}")
+    lines.append(f"Time (UTC/Local): {ts_utc} / {ts_local}")
+    lines.append(f"Host: {host}")
+    if meta.get("service"):
+        lines.append(f"Service: {meta['service']}")
+    if build:
+        lines.append(f"Build: {build}")
+    if summary_bits:
+        lines.append("Summary: " + " | ".join(summary_bits))
+    if payload_rows:
+        lines.append("")
+        lines.append("Details:")
+        for k, v in payload_rows:
+            lines.append(f"- {k}: {v}")
+    if last_line:
+        lines.append("")
+        lines.append("Last log line:")
+        lines.append(last_line)
+
+    return "\n".join(lines), html

@@ -1,0 +1,239 @@
+from __future__ import annotations
+
+import os
+import socket
+import smtplib
+import inspect
+from typing import Dict, Any, Optional, Tuple
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+
+import capbot.notify.email_templates as tmpl
+
+
+def _safe_get(d: Dict[str, Any], *keys, default=None):
+    cur = d
+    for k in keys:
+        if not isinstance(cur, dict) or k not in cur:
+            return default
+        cur = cur[k]
+    return cur
+
+
+def _env(name: str, default: str = "") -> str:
+    v = os.getenv(name)
+    return default if v is None else str(v)
+
+
+def _send_smtp(subj: str, text_body: str, html_body: str, cfg: Optional[Dict[str, Any]] = None) -> None:
+    cfg = cfg or {}
+
+    host = _env("SMTP_HOST") or _safe_get(cfg, "smtp", "host", default="")
+    port = int(_env("SMTP_PORT") or _safe_get(cfg, "smtp", "port", default=587) or 587)
+    user = _env("SMTP_USER") or _safe_get(cfg, "smtp", "user", default="")
+    pwd  = _env("SMTP_PASS") or _safe_get(cfg, "smtp", "pass", default="")
+
+    mail_to   = _env("EMAIL_TO") or _safe_get(cfg, "email", "to", default="")
+    mail_from = _env("EMAIL_FROM") or _safe_get(cfg, "email", "from", default=user)
+
+    if not (host and mail_to and mail_from):
+        raise RuntimeError(f"SMTP not configured (host/to/from). host={host!r} to={mail_to!r} from={mail_from!r}")
+
+    msg = MIMEMultipart("alternative")
+    msg["Subject"] = subj
+    msg["From"] = mail_from
+    msg["To"] = mail_to
+
+    msg.attach(MIMEText(text_body or "", "plain", "utf-8"))
+    msg.attach(MIMEText(html_body or "", "html", "utf-8"))
+
+    with smtplib.SMTP(host, port, timeout=20) as s:
+        s.ehlo()
+        try:
+            s.starttls()
+            s.ehlo()
+        except Exception:
+            pass
+
+        if user and pwd:
+            s.login(user, pwd)
+
+        s.sendmail(mail_from, [mail_to], msg.as_string())
+
+
+def _render_email_compat(event: str, bot_id: str, payload: Dict[str, Any], meta: Dict[str, Any]) -> Tuple[str, str]:
+    """
+    Compat: soporta render_email(event, bot_id, payload, meta)
+    (y si algún día cambia, lo detecta por aridad).
+    """
+    fn = tmpl.render_email
+    n = len(inspect.signature(fn).parameters)
+    if n >= 4:
+        return fn(event, bot_id, payload, meta)  # type: ignore[misc]
+    if n == 3:
+        return fn(event, payload, meta)  # type: ignore[misc]
+    return fn(event, bot_id, payload)  # type: ignore[misc]
+
+
+def _subject_compat(event: str, payload: Dict[str, Any], meta: Dict[str, Any]) -> str:
+    fn = tmpl.subject
+    n = len(inspect.signature(fn).parameters)
+    if n >= 3:
+        return fn(event, payload, meta)  # type: ignore[misc]
+    return fn(event, payload)  # type: ignore[misc]
+
+def _fmt(x, nd=2):
+    try:
+        return f"{float(x):.{nd}f}"
+    except Exception:
+        return str(x)
+
+def _enrich_email(event: str, payload: Dict[str, Any], meta: Dict[str, Any], subj: str, text_body: str, html_body: str):
+    """
+    Enriches outgoing email regardless of template:
+    - EXIT_*: add PnL (cash/points/R) if present
+    - TRAIL_*: make 1R/2R/BE extremely visible (subject + banner + SL move)
+    """
+    ev = str(event or "")
+    p = payload or {}
+
+    # --- TRAIL: make subject obvious ---
+    if ev.startswith("TRAIL_"):
+        ms = str(p.get("milestone") or p.get("trail") or ev.replace("TRAIL_", ""))
+        msu = ms.upper()
+        if "TRAIL" not in subj.upper():
+            if msu in ("BE", "BREAKEVEN"):
+                subj = subj + " | TRAIL BE ✅"
+            elif msu == "1R":
+                subj = subj + " | TRAIL 1R (SL→BE) ✅"
+            elif msu == "2R":
+                subj = subj + " | TRAIL 2R (SL→+1R) ✅"
+            else:
+                subj = subj + f" | TRAIL {msu} ✅"
+
+        sl_old = p.get("sl_old")
+        sl_new = p.get("sl_new")
+        cp = p.get("close_price") or p.get("price") or ""
+
+        # TEXT addendum
+        extra_t = []
+        extra_t.append(f"\n\n=== TRAILING UPDATE ({msu}) ===")
+        if sl_old is not None or sl_new is not None:
+            extra_t.append(f"SL move: {_fmt(sl_old,1)} -> {_fmt(sl_new,1)}")
+        if cp != "":
+            extra_t.append(f"Price ref: {_fmt(cp,1)}")
+        if p.get("r_multiple_est") is not None:
+            extra_t.append(f"R multiple (est): {_fmt(p.get('r_multiple_est'),2)}")
+        text_body = (text_body or "") + "\n".join(extra_t) + "\n"
+
+        # HTML banner
+        banner = (
+            "<div style='margin:12px 0;padding:14px;border-radius:12px;"
+            "background:#111;color:#fff;font-weight:800;font-size:16px;'>"
+            f"TRAILING UPDATE: {msu}"
+            "</div>"
+        )
+        lines = []
+        if sl_old is not None or sl_new is not None:
+            lines.append(f"<li><b>SL move</b>: {_fmt(sl_old,1)} → {_fmt(sl_new,1)}</li>")
+        if cp != "":
+            lines.append(f"<li><b>Price ref</b>: {_fmt(cp,1)}</li>")
+        if p.get("r_multiple_est") is not None:
+            lines.append(f"<li><b>R multiple (est)</b>: {_fmt(p.get('r_multiple_est'),2)}</li>")
+        ul = "<ul style='margin:8px 0 0 18px;'>" + "".join(lines) + "</ul>" if lines else ""
+        html_body = (banner + ul + "<hr/>" + (html_body or ""))
+
+    # --- EXIT: add PnL if present ---
+    if ev.startswith("EXIT_"):
+        pnl_pts = p.get("pnl_points_est")
+        pnl_cash = p.get("pnl_cash_est")
+        rmult = p.get("r_multiple_est")
+        if pnl_pts is not None or pnl_cash is not None or rmult is not None:
+            extra_t = []
+            extra_t.append("\n\n=== PnL (est) ===")
+            if pnl_pts is not None:
+                extra_t.append(f"PnL points: {_fmt(pnl_pts,2)}")
+            if pnl_cash is not None:
+                extra_t.append(f"PnL $: {_fmt(pnl_cash,2)}")
+            if rmult is not None:
+                extra_t.append(f"R multiple: {_fmt(rmult,2)}")
+            text_body = (text_body or "") + "\n".join(extra_t) + "\n"
+
+            lines = []
+            if pnl_pts is not None:
+                lines.append(f"<li><b>PnL points</b>: {_fmt(pnl_pts,2)}</li>")
+            if pnl_cash is not None:
+                lines.append(f"<li><b>PnL $</b>: {_fmt(pnl_cash,2)}</li>")
+            if rmult is not None:
+                lines.append(f"<li><b>R multiple</b>: {_fmt(rmult,2)}</li>")
+            html_body = (
+                "<div style='margin:12px 0;padding:12px;border-radius:12px;background:#f3f4f6;'>"
+                "<div style='font-weight:800;margin-bottom:6px;'>PnL (est)</div>"
+                "<ul style='margin:0 0 0 18px;'>" + "".join(lines) + "</ul>"
+                "</div>"
+                + (html_body or "")
+            )
+
+    return subj, text_body, html_body
+
+
+def email_event(enabled: bool, bot_id: str, event: str, data: Dict[str, Any], logfile: str = "", cfg: Optional[Dict[str, Any]] = None) -> None:
+    if not enabled:
+        return
+
+    cfg = cfg or {}
+    host = socket.gethostname()
+
+    meta = {
+        "bot_id": bot_id,
+        "host": host,
+        "service": data.get("service") or cfg.get("service") or "",
+        "config_path": data.get("config_path") or cfg.get("_config_path") or cfg.get("config_path") or "",
+        "logfile": logfile or data.get("logfile") or "",
+        "build": data.get("build") or "",
+        "market": data.get("market") or cfg.get("market") or cfg.get("symbol") or "",
+        "timeframe": data.get("timeframe") or cfg.get("timeframe") or cfg.get("resolution") or "",
+        "ts_utc": data.get("ts_utc") or "",
+        "ts_local": data.get("ts_local") or "",
+    }
+
+    # si no nos pasan timestamps, al menos mete UTC ahora
+    if not meta["ts_utc"]:
+        meta["ts_utc"] = datetime_utc = __import__("datetime").datetime.now(__import__("datetime").timezone.utc).strftime("%Y-%m-%d %H:%M:%SZ")
+
+    payload = dict(data or {})
+    payload["event"] = event
+    payload.setdefault("bot_id", bot_id)
+
+    subj = _subject_compat(event, payload, meta)
+    text_body, html_body = _render_email_compat(event=event, bot_id=bot_id, payload=payload, meta=meta)
+
+    
+    subj, text_body, html_body = _enrich_email(event, payload, meta, subj, text_body, html_body)
+try:
+        _send_smtp(subj, text_body, html_body, cfg=cfg)
+        print(f"EMAIL OK subject=[{subj}]")
+    except Exception as e:
+        try:
+            print(f"EMAIL_ERR: {repr(e)} subject=[{subj}]")
+        except Exception:
+            pass
+
+
+def email_startup(enabled: bool, bot_id: str, cfg: Dict[str, Any], logfile: str = "") -> None:
+    """
+    Email de arranque del bot (bonito HTML) usando la misma plantilla.
+    """
+    if not enabled:
+        return
+
+    data = {
+        "event": "STARTED",
+        "bot_id": bot_id,
+        "market": (cfg.get("market") or cfg.get("symbol") or "Germany 40"),
+        "timeframe": (cfg.get("timeframe") or cfg.get("resolution") or "5m"),
+        "strategy": ((cfg.get("strategy") or {}).get("module") or ""),
+        "config_path": cfg.get("_config_path") or cfg.get("config_path") or "",
+        "logfile": logfile or "",
+    }
+    email_event(True, bot_id, "STARTED", data, logfile=logfile, cfg=cfg)

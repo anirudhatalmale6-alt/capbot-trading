@@ -1,0 +1,138 @@
+from __future__ import annotations
+
+import os
+import socket
+from datetime import datetime, timezone
+from typing import Any, Dict, Tuple, Optional
+
+# Si ya tienes utilidades SMTP en este mismo fichero o en otro módulo,
+# deja estas imports como estén en tu repo. Aquí asumimos que _send_smtp existe.
+# Si _send_smtp está en el propio notifier.py, perfecto.
+# Si está en otro sitio, ajusta el import.
+from capbot.notify.email_templates import subject as tmpl_subject, render_html
+
+
+def _now_utc_iso() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%SZ")
+
+
+def _get_host() -> str:
+    try:
+        return socket.gethostname()
+    except Exception:
+        return "-"
+
+
+def _safe_get(d: Dict[str, Any], *keys, default=None):
+    cur = d
+    for k in keys:
+        if not isinstance(cur, dict) or k not in cur:
+            return default
+        cur = cur[k]
+    return cur
+
+
+def _build_meta(bot_id: str, cfg: Optional[Dict[str, Any]], logfile) -> Dict[str, Any]:
+    # cfg puede ser None en algunos paths legacy
+    cfg = cfg or {}
+
+    market = _safe_get(cfg, "market", default=_safe_get(cfg, "strategy", "market", default=""))
+    schedule = _safe_get(cfg, "schedule", default={}) or {}
+    tz_name = schedule.get("tz_name") or schedule.get("timezone") or ""
+
+    meta = {
+        "ts_utc": _now_utc_iso(),
+        "ts_local": "",  # opcional, si quieres lo añadimos desde engine/estrategia
+        "bot_id": bot_id,
+        "service": os.environ.get("CAPBOT_SERVICE", ""),  # opcional
+        "host": _get_host(),
+        "build": os.environ.get("CAPBOT_BUILD", ""),
+        "config_path": os.environ.get("CAPBOT_CONFIG", ""),
+        "logfile": str(logfile) if logfile else "",
+        "market": market,
+        "tz": tz_name,
+    }
+    return meta
+
+
+def _send_smtp(subject: str, text_body: str, html_body: str) -> None:
+    """
+    En tu repo esto ya existe (por lo visto mandas emails).
+    Si ya tenías implementación previa, NO la dupliques.
+    Si no existe, dime dónde está y lo ajusto.
+
+    Por ahora, intentamos usar mailutils si no hay SMTP directo.
+    """
+    # Preferimos tu SMTP (si ya lo tienes en otro sitio) => reemplaza esto por tu función real.
+    # Fallback simple: usa 'mail' (GNU mailutils) si está disponible.
+    import shutil
+    import subprocess
+
+    if shutil.which("mail"):
+        to_ = os.environ.get("EMAIL_TO", "")
+        from_ = os.environ.get("EMAIL_FROM", "")
+        # mailutils no siempre respeta From, depende config del sistema; lo dejamos simple.
+        p = subprocess.Popen(["mail", "-s", subject, to_], stdin=subprocess.PIPE, text=True)
+        p.communicate(text_body)
+        if p.returncode != 0:
+            raise RuntimeError(f"mail returned {p.returncode}")
+        return
+
+    raise RuntimeError("No mailer available (no 'mail' command).")
+
+
+def _render_email(event: str, bot_id: str, cfg: Dict[str, Any], data: Dict[str, Any], logfile) -> Tuple[str, str, str]:
+    meta = _build_meta(bot_id, cfg, logfile)
+
+    market = meta.get("market") or bot_id
+    # subject corto como quieres: "Germany40 5m | HEALTH" o similar
+    # event normalizado
+    event_norm = event.upper()
+    extra = ""
+
+    subj = f"{market} 5m | {event_norm}"
+
+    html = render_html(event_norm, market, payload=(data or {}), meta=meta)
+
+    # Texto plano mínimo (por si algún cliente no renderiza HTML)
+    lines = [
+        f"{market} 5m | {event_norm}",
+        f"UTC: {meta.get('ts_utc','')}",
+        f"Host: {meta.get('host','')} Service: {meta.get('service','')}",
+        "",
+    ]
+    for k, v in (data or {}).items():
+        lines.append(f"{k}: {v}")
+    text = "\n".join(lines)
+
+    return subj, text, html
+
+
+def email_event(enabled: bool, bot_id: str, event: str, data: Dict[str, Any], logfile=None, cfg: Optional[Dict[str, Any]] = None) -> None:
+    if not enabled:
+        return
+    cfg = cfg or {}
+    subj, text_body, html_body = _render_email(event, bot_id, cfg, data, logfile)
+    try:
+        _send_smtp(subj, text_body, html_body)
+        print(f"[{_now_utc_iso()}] EMAIL OK subject={subj}")
+    except Exception as e:
+        try:
+            print(f"[{_now_utc_iso()}] EMAIL_ERR: {repr(e)} subject={subj}")
+        except Exception:
+            pass
+
+
+def email_startup(enabled: bool, bot_id: str, cfg: Dict[str, Any], logfile=None) -> None:
+    """
+    Engine lo llama al arrancar. Lo restauramos para que no rompa.
+    """
+    if not enabled:
+        return
+    data = {
+        "status": "startup_ok",
+        "bot_id": bot_id,
+        "market": _safe_get(cfg, "market", default=""),
+        "strategy": _safe_get(cfg, "strategy", "module", default=""),
+    }
+    email_event(True, bot_id, "STARTED", data, logfile=logfile, cfg=cfg)

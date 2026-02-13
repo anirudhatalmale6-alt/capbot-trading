@@ -1,0 +1,193 @@
+from __future__ import annotations
+
+from typing import Any, Dict, Optional
+import numpy as np
+import pandas as pd
+
+from capbot.strategies.vwap_pullback_rsi import Signal  # reutilizamos el dataclass
+
+def _sma(s: pd.Series, n: int) -> pd.Series:
+    return s.rolling(n, min_periods=n).mean()
+
+def rsi_sma(close: pd.Series, length: int = 14) -> pd.Series:
+    delta = close.diff()
+    up = delta.clip(lower=0.0)
+    down = (-delta).clip(lower=0.0)
+
+    up_sma = _sma(up, length)
+    down_sma = _sma(down, length)
+
+    # spec: si down == 0 => RSI inválido
+    rs = up_sma / down_sma.replace(0, np.nan)
+    rsi = 100.0 - (100.0 / (1.0 + rs))
+    # invalida donde down_sma==0 o NaN
+    rsi = rsi.where(down_sma.notna() & (down_sma != 0))
+    return rsi
+
+def atr_sma(df: pd.DataFrame, length: int = 14) -> pd.Series:
+    high = df["high"].astype(float)
+    low = df["low"].astype(float)
+    close = df["close"].astype(float)
+    prev_close = close.shift(1)
+
+    tr1 = (high - low).abs()
+    tr2 = (high - prev_close).abs()
+    tr3 = (low - prev_close).abs()
+    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+
+    return _sma(tr, length)
+
+class SP5005MSpec:
+    """
+    SP500 5m EXACT SPEC:
+      - Señal en vela cerrada i (df.iloc[-2])
+      - Entry "conceptual" = close[i] (para sizing/levels). Orden market se envía tras cierre.
+      - RSI/ATR: SMA (NO Wilder)
+      - Gestión: TP primero, luego SL; trailing end-of-bar con high/low; BE lock
+      - Time-exit: 24 velas -> close[i+24], evaluado después TP/SL en esa vela
+    """
+
+    def enrich(self, df: pd.DataFrame, params: Dict[str, Any]) -> pd.DataFrame:
+        d = df.copy()
+
+
+        # --- VWAP robusto (evita NaN) ---
+        try:
+            import numpy as np
+            import pandas as pd
+            if "volume" in d.columns and "high" in d.columns and "low" in d.columns and "close" in d.columns:
+                v = pd.to_numeric(d["volume"], errors="coerce").fillna(0.0)
+                h = pd.to_numeric(d["high"], errors="coerce")
+                l = pd.to_numeric(d["low"], errors="coerce")
+                c = pd.to_numeric(d["close"], errors="coerce")
+                tp = (h + l + c) / 3.0
+                # reset diário (UTC) para evitar drift infinito
+                day = d.index.floor("D")
+                pv = (tp * v)
+                cum_pv = pv.groupby(day).cumsum()
+                cum_v  = v.groupby(day).cumsum()
+                d["vwap"] = cum_pv / cum_v.replace(0, np.nan)
+        except Exception:
+            pass
+
+        vol_window = int(params.get("VOL_WINDOW", 20))
+        rsi_len = int(params.get("RSI_LEN", 14))
+        atr_len = int(params.get("ATR_LEN", 14))
+
+        # Body ratio
+        rng = (d["high"].astype(float) - d["low"].astype(float))
+        d["range"] = rng
+        d["body_ratio"] = (d["close"].astype(float) - d["open"].astype(float)).abs() / rng.replace(0, np.nan)
+
+        # Vol rel: SMA20(volume) incluyendo volume[i]
+        vol = d["volume"].astype(float)
+        d["vol_ma20"] = vol.rolling(vol_window, min_periods=vol_window).mean()
+        d["vol_rel"] = vol / d["vol_ma20"].replace(0, np.nan)
+
+        # Prev3 excluye vela señal: bear_prev3[i] = bear[i-1]+bear[i-2]+bear[i-3]
+        bear = (d["close"].astype(float) < d["open"].astype(float)).astype(int)
+        bull = (d["close"].astype(float) > d["open"].astype(float)).astype(int)
+        d["bear_prev3"] = bear.shift(1).rolling(3, min_periods=3).sum()
+        d["bull_prev3"] = bull.shift(1).rolling(3, min_periods=3).sum()
+
+        # RSI/ATR SMA
+        d["rsi14"] = rsi_sma(d["close"].astype(float), rsi_len)
+        d["atr14"] = atr_sma(d, atr_len)
+
+    # DBG VWAP
+    try:
+        if 'vwap' in d.columns:
+            vwap_nan = int(d['vwap'].isna().sum())
+            vwap_len = int(len(d))
+        else:
+            vwap_nan = None
+            vwap_len = int(len(d))
+        vol_min = float(d['volume'].min()) if 'volume' in d.columns else None
+        vol_max = float(d['volume'].max()) if 'volume' in d.columns else None
+        log_line = getattr(__import__('capbot.app.engine', fromlist=['log_line']), 'log_line')
+        log_line(getattr(__import__('capbot.app.engine', fromlist=['_get_logfile']), '_get_logfile')(), 
+                 f"DBG_VWAP: has_vwap={'vwap' in d.columns} nan={vwap_nan}/{vwap_len} vol_min={vol_min} vol_max={vol_max}")
+    except Exception:
+        pass
+
+
+        return d
+
+    def signal_on_bar_close(self, df: pd.DataFrame, params: Dict[str, Any]) -> Optional[Signal]:
+        if df is None or df.empty or len(df) < 50:
+            return None
+
+        i = -2
+        row = df.iloc[i]
+        ts_utc = df.index[i]  # tz-aware UTC en engine
+        ts_ny = ts_utc.tz_convert("America/New_York")
+
+        # 2) filtros en vela señal
+        # RTH NY inclusivo: 09:30 <= hh:mm <= 16:00
+        hhmm = ts_ny.hour * 60 + ts_ny.minute
+        if not ( (9*60+30) <= hhmm <= (16*60) ):
+            return None
+
+        # No jueves UTC (weekday==3)
+        if ts_utc.weekday() == 3:
+            return None
+
+        # params
+        BODY_MIN = float(params.get("BODY_MIN", 0.70))
+        VOL_REL_MIN = float(params.get("VOL_REL_MIN", 0.70))
+        RSI_LONG_MAX = float(params.get("RSI_LONG_MAX", 75))
+        RSI_SHORT_MIN = float(params.get("RSI_SHORT_MIN", 40))
+        BEAR_PREV3_LONG = int(params.get("BEAR_PREV3_LONG", 2))
+        BULL_PREV3_SHORT = int(params.get("BULL_PREV3_SHORT", 2))
+
+        # 3) validar indicadores disponibles
+        need = ["range","body_ratio","vol_ma20","vol_rel","rsi14","atr14","bear_prev3","bull_prev3"]
+        for k in need:
+            v = row.get(k)
+            if v is None or (isinstance(v, float) and (np.isnan(v) or np.isinf(v))):
+                return None
+
+        if float(row["range"]) <= 0:
+            return None
+
+        # spec: down==0 => RSI inválido ya queda NaN, así que ya cayó arriba
+
+        br = float(row["body_ratio"])
+        vr = float(row["vol_rel"])
+        if br < BODY_MIN or vr < VOL_REL_MIN:
+            return None
+
+        close_px = float(row["close"])
+        open_px = float(row["open"])
+        rsi = float(row["rsi14"])
+        atr = float(row["atr14"])
+        bear3 = float(row["bear_prev3"])
+        bull3 = float(row["bull_prev3"])
+
+        # LONG
+        if (close_px > open_px) and (bear3 >= BEAR_PREV3_LONG) and (rsi < RSI_LONG_MAX):
+            return Signal(direction="BUY", entry_price_est=close_px, meta={
+                "ts_signal_utc": ts_utc.isoformat(),
+                "ts_signal_ny": ts_ny.isoformat(),
+                "entry_price_spec": close_px,
+                "atr_entry": atr,
+                "rsi14": rsi,
+                "body_ratio": br,
+                "vol_rel": vr,
+                "bear_prev3": bear3,
+            })
+
+        # SHORT
+        if (close_px < open_px) and (bull3 >= BULL_PREV3_SHORT) and (rsi > RSI_SHORT_MIN):
+            return Signal(direction="SELL", entry_price_est=close_px, meta={
+                "ts_signal_utc": ts_utc.isoformat(),
+                "ts_signal_ny": ts_ny.isoformat(),
+                "entry_price_spec": close_px,
+                "atr_entry": atr,
+                "rsi14": rsi,
+                "body_ratio": br,
+                "vol_rel": vr,
+                "bull_prev3": bull3,
+            })
+
+        return None

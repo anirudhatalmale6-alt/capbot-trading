@@ -1,0 +1,672 @@
+ENGINE_BUILD_TAG = "20260126_fetch_checks_v1"
+
+import os
+import time
+from typing import Any, Dict, Optional
+
+import pandas as pd
+
+def _to_utc_ts(x):
+    """Best-effort: convert x to tz-aware UTC pandas Timestamp."""
+    try:
+        ts = pd.Timestamp(x)
+    except Exception:
+        # last resort: try numeric seconds/ms
+        try:
+            xv = float(x)
+            ts = pd.to_datetime(xv, unit="s", utc=True)
+        except Exception:
+            ts = pd.to_datetime(x, utc=True, errors="coerce")
+    if ts is pd.NaT:
+        return pd.Timestamp.utcnow().tz_localize("UTC")
+    if ts.tzinfo is None:
+        return ts.tz_localize("UTC")
+    return ts.tz_convert("UTC")
+
+
+
+def _ensure_utc_datetime_index(df: "pd.DataFrame") -> "pd.DataFrame":
+    """Ensure df.index is tz-aware UTC DatetimeIndex.
+    If not, try to build it from common time columns.
+    """
+    import pandas as pd
+
+def _to_utc_ts(x):
+    """Best-effort: convert x to tz-aware UTC pandas Timestamp."""
+    try:
+        ts = pd.Timestamp(x)
+    except Exception:
+        # last resort: try numeric seconds/ms
+        try:
+            xv = float(x)
+            ts = pd.to_datetime(xv, unit="s", utc=True)
+        except Exception:
+            ts = pd.to_datetime(x, utc=True, errors="coerce")
+    if ts is pd.NaT:
+        return pd.Timestamp.utcnow().tz_localize("UTC")
+    if ts.tzinfo is None:
+        return ts.tz_localize("UTC")
+    return ts.tz_convert("UTC")
+
+
+    if isinstance(df.index, pd.DatetimeIndex):
+        idx = df.index
+    else:
+        # Try common time columns
+        time_cols = ["time", "snapshotTimeUTC", "snapshotTime", "timestamp", "datetime", "date"]
+        col = next((c for c in time_cols if c in df.columns), None)
+        if col is None:
+            raise ValueError("DataFrame sin DatetimeIndex y sin columna de tiempo conocida (time/snapshotTimeUTC/...).")
+        idx = pd.to_datetime(df[col], errors="coerce", utc=True)
+
+    if not isinstance(idx, pd.DatetimeIndex):
+        idx = pd.DatetimeIndex(idx)
+
+    # Ensure tz-aware UTC
+    if idx.tz is None:
+        idx = idx.tz_localize("UTC")
+    else:
+        idx = idx.tz_convert("UTC")
+
+    out = df.copy()
+    out.index = idx
+    return out
+
+from capbot.app.notifier import email_event, email_startup
+from capbot.broker.capital_client import CapitalClient, pick_position_dealid_from_confirm
+from capbot.data.prices import prices_to_df
+from capbot.domain.lock import InstanceLock
+from capbot.domain.logger import log_line
+from capbot.domain.paths import bot_paths
+from capbot.domain.risk import calc_position_size
+from capbot.domain.schedule import RTH
+from capbot.domain.state_store import load_state, save_state_atomic
+from capbot.domain.trade_log import append_row, ensure_header
+from capbot.domain.trailing import maybe_trail_option_a
+from capbot.strategies.loader import load_strategy
+
+
+def utc_now() -> pd.Timestamp:
+    return pd.Timestamp.now(tz="UTC")
+
+
+def _as_ts(x: Optional[str]) -> Optional[pd.Timestamp]:
+    if not x:
+        return None
+    try:
+        return pd.to_datetime(x, utc=True)
+    except Exception:
+        return None
+
+
+def _resolution_to_minutes(resolution: str) -> int:
+    r = (resolution or "").upper().strip()
+    if r.startswith("MINUTE_"):
+        try:
+            return int(r.split("_", 1)[1])
+        except Exception:
+            return 5
+    if r in ("HOUR", "HOUR_1"):
+        return 60
+    if r == "HOUR_4":
+        return 240
+    if r == "DAY":
+        return 1440
+    return 5
+
+
+def _rth_is_open(rth: RTH, ts: pd.Timestamp) -> bool:
+    fn = getattr(rth, "is_open", None)
+    if callable(fn):
+        return bool(fn(ts))
+
+    # fallback manual
+    import pytz
+    tz = pytz.timezone(getattr(rth, "tz_name", "UTC"))
+    local = ts.tz_convert(tz)
+    if local.weekday() >= 5:
+        return False
+    sh = int(getattr(rth, "start_hh", 0))
+    sm = int(getattr(rth, "start_mm", 0))
+    eh = int(getattr(rth, "end_hh", 23))
+    em = int(getattr(rth, "end_mm", 59))
+    start = local.replace(hour=sh, minute=sm, second=0, microsecond=0)
+    end = local.replace(hour=eh, minute=em, second=0, microsecond=0)
+    return start <= local <= end
+def _trail_sp500_spec(direction: str, entry: float, atr_entry: float, sl: float,
+                      be_armed: bool, max_fav: float, min_fav: float,
+                      bar_high: float, bar_low: float):
+    """
+    SPEC end-of-bar trailing + BE lock.
+    Update ONLY if trade survives TP/SL check on this bar.
+    """
+    direction = str(direction).upper()
+    if atr_entry <= 0:
+        return sl, be_armed, max_fav, min_fav
+
+    if direction == "BUY":
+        max_fav = max(float(max_fav), float(bar_high))
+        if float(bar_high) > float(entry):
+            be_armed = True
+        sl_cand = float(max_fav) - 1.0 * float(atr_entry)
+        sl = max(float(sl), float(sl_cand))
+        if be_armed:
+            sl = max(float(sl), float(entry))
+        return sl, be_armed, max_fav, min_fav
+
+    else:
+        min_fav = min(float(min_fav), float(bar_low))
+        if float(bar_low) < float(entry):
+            be_armed = True
+        sl_cand = float(min_fav) + 1.0 * float(atr_entry)
+        sl = min(float(sl), float(sl_cand))
+        if be_armed:
+            sl = min(float(sl), float(entry))
+        return sl, be_armed, max_fav, min_fav
+
+
+
+def run_bot(cfg: Dict[str, Any], once: bool = False):
+
+    try:
+        paths = bot_paths(str(cfg.get("bot_id") or (cfg.get("market") or {}).get("epic") or "capbot"))
+        log_line(paths["logfile"], f"ENGINE_BUILD_TAG={ENGINE_BUILD_TAG}")
+    except Exception:
+        pass
+
+
+    try:
+        log_line(bot_paths(str(cfg.get('bot_id') or 'capbot'))['logfile'], 'ENGINE_BUILD=20260126_fetch_checks_v1')
+    except Exception:
+        pass
+    bot_id = str(cfg.get("bot_id") or (cfg.get("market") or {}).get("epic") or "capbot")
+
+    state_path, csv_path, logfile, lock_path = bot_paths(bot_id)
+
+    try:
+        lock = InstanceLock(lock_path, 1800)
+    except TypeError:
+        lock = InstanceLock(lock_path)
+
+    def save_state(st: dict):
+        save_state_atomic(state_path, st)
+
+    lock.acquire()
+    try:
+        ensure_header(csv_path)
+        st = load_state(state_path) or {}
+
+        poll = int(cfg.get("poll_seconds", 30))
+
+        # ---- Market / data ----
+        market = cfg.get("market") or {}
+        epic = str(market.get("epic") or "").strip()
+        resolution = str(market.get("resolution") or "MINUTE_5").strip()
+        warmup = int(market.get("warmup_bars", 200))
+        if not epic:
+            raise RuntimeError("Config error: market.epic is missing")
+
+        bar_minutes = _resolution_to_minutes(resolution)
+
+        # ---- Schedule ----
+        schedule_cfg = cfg.get("schedule") or {}
+        tz_name = str(schedule_cfg.get("timezone", "Europe/Berlin"))
+        rth_enabled = bool(schedule_cfg.get("rth_enabled", True))
+        disable_thursday_utc = bool(schedule_cfg.get("disable_thursday_utc", True))
+
+        rth_start = str(schedule_cfg.get("rth_start", "09:30"))
+        rth_end = str(schedule_cfg.get("rth_end", "17:30"))
+
+        rth = RTH(
+            tz_name=tz_name,
+            start_hh=int(rth_start.split(":")[0]),
+            start_mm=int(rth_start.split(":")[1]),
+            end_hh=int(rth_end.split(":")[0]),
+            end_mm=int(rth_end.split(":")[1]),
+        )
+
+        # ---- Risk ----
+        risk_cfg = cfg.get("risk") or {}
+        bot_equity = float(risk_cfg.get("bot_equity", 25000.0))
+        risk_pct = float(risk_cfg.get("risk_pct", 0.02))
+        vpp = float(risk_cfg.get("value_per_point_per_size", 1.0))
+        exit_bars = int(risk_cfg.get("exit_bars", 24))
+
+        # ---- Trailing ----
+        trailing_cfg = cfg.get("trailing") or {}
+        trailing_on = bool(trailing_cfg.get("enabled", True))
+        trail_buffer_r = float(trailing_cfg.get("buffer_r", 0.10))
+
+        # ---- Circuit breaker ----
+        cb_cfg = cfg.get("circuit_breaker") or {}
+        cb_losses = int(cb_cfg.get("losses", 3))
+        cb_cooldown = int(cb_cfg.get("cooldown_min", 60))
+
+        # ---- Notifications ----
+        notif_cfg = cfg.get("notifications") or {}
+        email_enabled = bool(notif_cfg.get("email_enabled", True))
+
+        # ---- Strategy ----
+        strategy_cfg = cfg.get("strategy") or {}
+        strat = load_strategy(strategy_cfg.get("module"))
+        strat_params = strategy_cfg.get("params") or {}
+
+        # ---- Account selection ----
+        account_cfg = cfg.get("account") or {}
+        account_id = account_cfg.get("account_id") or os.environ.get("CAPITAL_ACCOUNT_ID")
+
+        client = CapitalClient()
+        email_startup(email_enabled, bot_id, cfg, logfile)
+
+        last_closed_time = _as_ts(st.get("last_closed_time"))
+
+        while True:
+            now = utc_now()
+
+            # ---- Heartbeat diario al abrir RTH (Berlin) ----
+            try:
+                now_local = now.tz_convert(tz_name)
+                if now_local.weekday() < 5:
+                    sh, sm = map(int, rth_start.split(":"))
+                    if now_local.hour == sh and now_local.minute == sm:
+                        sent_date = st.get("heartbeat_sent_date")
+                        today = now_local.date().isoformat()
+                        if sent_date != today:
+                            email_event(email_enabled, bot_id, "HEARTBEAT_RTH_OPEN", {
+                                "time_local": now_local.isoformat(),
+                                "timezone": tz_name,
+                                "account_id": account_id,
+                                "epic": epic,
+                                "poll_seconds": poll,
+                            }, logfile)
+                            st["heartbeat_sent_date"] = today
+                            save_state(st)
+            except Exception as e:
+                log_line(logfile, f"HEARTBEAT warning: {repr(e)}")
+
+            # Ensure session + correct account
+            client.login()
+            client.ensure_account(account_id)
+
+            pos = st.get("pos") or {}
+            deal_id = pos.get("deal_id")
+            in_position = bool(deal_id)
+
+            # ===========================
+            # 9) Gestión si hay posición
+            # ===========================
+            if in_position:
+                px = client.get_prices(epic, resolution, max_points=max(warmup, 200))
+                df = prices_to_df(px)
+                if df is None or df.empty or len(df) < 3:
+                    log_line(logfile, "WARN: no prices returned")
+                    if once:
+                        return
+                    time.sleep(poll)
+                    continue
+
+                # Siempre con la vela cerrada (determinista)
+                bar_t = _to_utc_ts(df.index[-2])
+                last_mgmt = st.get("last_mgmt_bar_iso")
+                if last_mgmt and str(last_mgmt) == str(_to_utc_ts(bar_t).isoformat()):
+                    if once:
+                        return
+                    time.sleep(poll)
+                    continue
+
+                st["last_mgmt_bar_iso"] = _to_utc_ts(bar_t).isoformat()
+                save_state(st)
+
+                bar = df.iloc[-2]
+                close_px = float(bar["close"])
+                bar_high = float(bar["high"])
+                bar_low = float(bar["low"])
+
+                direction = str(pos.get("direction")).upper()
+
+                # 1) OUTSIDE_RTH (Berlin): cerrar a mercado.
+                if rth_enabled and (not _rth_is_open(rth, now)):
+                    exit_price = close_px  # convención: close de la vela cerrada
+                    conf = client.close_position(str(deal_id))
+                    append_row(csv_path, now.isoformat(), bot_id, epic, direction, pos.get("size"), "EXIT_RTH", exit_price, conf)
+
+                    # Circuit breaker LOCAL al cerrar
+                    try:
+                        entry_price = float(pos.get("entry_price_est"))
+                        size_pos = float(pos.get("size"))
+                        profit_points = (exit_price - entry_price) if direction == "BUY" else (entry_price - exit_price)
+                        profit_cash = profit_points * size_pos * vpp
+                        consec = int(st.get("consec_losses", 0))
+                        consec = (consec + 1) if profit_cash < 0 else 0
+                        st["consec_losses"] = consec
+                        if consec >= cb_losses:
+                            st["cooldown_until_iso"] = (now + pd.Timedelta(minutes=cb_cooldown)).isoformat()
+                    except Exception:
+                        pass
+
+                    st["pos"] = {}
+                    st["last_closed_time"] = now.isoformat()
+                    save_state(st)
+                    email_event(email_enabled, bot_id, "EXIT_RTH", {"deal_id": deal_id, "exit_price": exit_price}, logfile)
+
+                    if once:
+                        return
+                    time.sleep(poll)
+                    continue
+
+                # 3/4) STOP/TP con high/low (TP primero si ambos cuando TP_FIRST)
+                sl_local = float(pos.get("sl_local"))
+                tp_local = float(pos.get("tp_local"))
+
+                hit_sl = (direction == "BUY" and bar_low <= sl_local) or (direction == "SELL" and bar_high >= sl_local)
+                hit_tp = (direction == "BUY" and bar_high >= tp_local) or (direction == "SELL" and bar_low <= tp_local)
+
+                if hit_sl or hit_tp:
+                    tp_first = ((cfg.get("engine_overrides") or {}).get("exit_priority") == "TP_FIRST")
+
+                    if tp_first:
+                        # TP primero si ambos
+                        if hit_tp:
+                            reason = "EXIT_TP"
+                            exit_price = float(tp_local)
+                        else:
+                            reason = "EXIT_SL"
+                            exit_price = float(sl_local)
+                    else:
+                        # Legacy: SL primero
+                        if hit_sl:
+                            reason = "EXIT_SL"
+                            exit_price = float(sl_local)
+                        else:
+                            reason = "EXIT_TP"
+                            exit_price = float(tp_local)
+
+                    conf = client.close_position(str(deal_id))
+                    append_row(csv_path, now.isoformat(), bot_id, epic, direction, pos.get("size"), reason, exit_price, conf)
+
+                    # Circuit breaker LOCAL
+                    try:
+                        entry_price = float(pos.get("entry_price_est"))
+                        size_pos = float(pos.get("size"))
+                        profit_points = (exit_price - entry_price) if direction == "BUY" else (entry_price - exit_price)
+                        profit_cash = profit_points * size_pos * vpp
+                        consec = int(st.get("consec_losses", 0))
+                        consec = (consec + 1) if profit_cash < 0 else 0
+                        st["consec_losses"] = consec
+                        if consec >= cb_losses:
+                            st["cooldown_until_iso"] = (now + pd.Timedelta(minutes=cb_cooldown)).isoformat()
+                    except Exception:
+                        pass
+
+                    st["pos"] = {}
+                    st["last_closed_time"] = now.isoformat()
+                    save_state(st)
+                    email_event(email_enabled, bot_id, reason, {"deal_id": deal_id, "exit_price": exit_price}, logfile)
+
+                    if once:
+                        return
+                    time.sleep(poll)
+                    continue
+
+                # 8) Trailing (SP500 spec end-of-bar, high/low, BE lock)
+                if (cfg.get("engine_overrides") or {}).get("mode") == "sp500_5m_spec":
+                    try:
+                        atr_entry = float(pos.get("atr_entry_const") or pos.get("atr_entry") or pos.get("atr_signal") or 0.0)
+                        entry_est = float(pos.get("entry_price_est"))
+                        sl_cur = float(pos.get("sl_local"))
+                        be_armed = bool(pos.get("be_armed", False))
+                        max_fav = float(pos.get("max_fav", entry_est))
+                        min_fav = float(pos.get("min_fav", entry_est))
+
+                        new_sl, be_armed, max_fav, min_fav = _trail_sp500_spec(
+                            direction=direction,
+                            entry=entry_est,
+                            atr_entry=atr_entry,
+                            sl=sl_cur,
+                            be_armed=be_armed,
+                            max_fav=max_fav,
+                            min_fav=min_fav,
+                            bar_high=bar_high,
+                            bar_low=bar_low,
+                        )
+
+                        if float(new_sl) != float(sl_cur) or bool(be_armed) != bool(pos.get("be_armed", False)):
+                            pos["sl_local"] = float(new_sl)
+                            pos["be_armed"] = bool(be_armed)
+                            pos["max_fav"] = float(max_fav)
+                            pos["min_fav"] = float(min_fav)
+                            st["pos"] = pos
+                            save_state(st)
+                            email_event(email_enabled, bot_id, "TRAIL_SL", {"deal_id": deal_id, "sl_local": new_sl, "be_armed": be_armed}, logfile)
+                    except Exception as e:
+                        log_line(logfile, f"TRAIL warning (sp500 spec): {repr(e)}")
+                else:
+                    # 8) Trailing SL (solo mejora, al cierre)
+                    if trailing_on:
+                        try:
+                            moved, new_sl, flags = maybe_trail_option_a(
+                                direction=direction,
+                                entry=float(pos.get('entry_price_est')),
+                                live=float(close_px),
+                                r_points=float(pos.get('r_points')),
+                                current_sl=float(pos.get('sl_local')),
+                                trail_1r_done=bool(pos.get('trail_1r_done')),
+                                trail_2r_done=bool(pos.get('trail_2r_done')),
+                                buffer_r=float(trail_buffer_r),
+                            )
+                            if moved:
+                                pos['sl_local'] = float(new_sl)
+                                pos['trail_1r_done'] = bool(flags.get('trail_1r_done'))
+                                pos['trail_2r_done'] = bool(flags.get('trail_2r_done'))
+                                st['pos'] = pos
+                                save_state(st)
+                                email_event(email_enabled, bot_id, 'TRAIL_SL', {'deal_id': deal_id, 'sl_local': new_sl}, logfile)
+                        except Exception as e:
+                            log_line(logfile, f"TRAIL warning: {repr(e)}")
+                if once:
+                    return
+                time.sleep(poll)
+                continue
+
+            # =======================
+            # 4) Gates de entradas
+            # =======================
+            # 1) No operar jueves UTC
+            if disable_thursday_utc and now.weekday() == 3:
+                log_line(logfile, "GATE: Thursday UTC disabled (entries blocked)")
+                if once:
+                    return
+                time.sleep(poll)
+                continue
+
+            # 2) Dentro de RTH Berlin
+            if rth_enabled and (not _rth_is_open(rth, now)):
+                # CHECK_RTHGATE_FETCH: always compute checks outside RTH by fetching prices
+                try:
+                    px_dbg = client.get_prices(epic, resolution, max_points=max(warmup, 200))
+                    df_dbg = prices_to_df(px_dbg)
+                    if df_dbg is None or getattr(df_dbg, "empty", True):
+                        log_line(logfile, "CHECK t(CLOSED)=NA rth=✗ reason=no_prices")
+                    else:
+                        try:
+                            df_dbg = _ensure_utc_datetime_index(df_dbg)
+                        except Exception:
+                            pass
+                        try:
+                            df_dbg = strat.enrich(df_dbg, strat_params)
+                        except TypeError:
+                            df_dbg = strat.enrich(df_dbg)
+                        i = -2 if len(df_dbg) >= 2 else -1
+                        row = df_dbg.iloc[i]
+                        bar_ts = _to_utc_ts(df_dbg.index[i]).isoformat()
+                        close = float(row.get("close", float("nan")))
+                        body  = float(row.get("body_ratio", float("nan")))
+                        volr  = float(row.get("vol_rel", float("nan")))
+                        rsi   = float(row.get("rsi14", float("nan")))
+                        atr   = float(row.get("atr14", float("nan")))
+                        vwap  = float(row.get("vwap", float("nan")))
+                        dist  = (close - vwap) if (close == close and vwap == vwap) else float("nan")
+                        bear3 = row.get("bear_prev3", None)
+                        bull3 = row.get("bull_prev3", None)
+                        log_line(logfile, f"CHECK t(CLOSED)={bar_ts} body={body:.3f} vol_rel={volr:.3f} rsi={rsi:.1f} atr={atr:.2f} vwap={vwap:.2f} dist={dist:.2f} bear_prev3={bear3} bull_prev3={bull3} rth=✗")
+                except Exception as e:
+                    log_line(logfile, f"CHECK_RTHGATE_FETCH warn: {type(e).__name__}: {e}")
+
+                log_line(logfile, f"GATE: outside RTH ({rth_start}-{rth_end} {tz_name})")
+                if once:
+                    return
+                time.sleep(poll)
+                continue
+            # 3) NO_TRADE_HOURS Berlin {9,14,15}
+            no_trade_hours = (cfg.get("strategy") or {}).get("no_trade_hours_berlin") \
+                             or (cfg.get("schedule") or {}).get("no_trade_hours_berlin") \
+                             or [9, 14, 15]
+            try:
+                now_local = now.tz_convert(tz_name)
+                if int(now_local.hour) in set(int(x) for x in no_trade_hours):
+                    log_line(logfile, f"GATE: NO_TRADE_HOURS Berlin hour={now_local.hour} blocked")
+                    if once:
+                        return
+                    time.sleep(poll)
+                    continue
+            except Exception:
+                pass
+
+            # 8) Circuit breaker (solo bloquea si flat)
+            cooldown_until = _as_ts(st.get("cooldown_until_iso"))
+            if cooldown_until and now < cooldown_until:
+                log_line(logfile, f"GATE: circuit breaker cooldown until {cooldown_until.isoformat()}")
+                if once:
+                    return
+                time.sleep(poll)
+                continue
+
+            # =======================
+            # 2) Señal en vela cerrada
+            # =======================
+            px = client.get_prices(epic, resolution, max_points=max(warmup, 200))
+            df = prices_to_df(px)
+            if df is None or df.empty or len(df) < 3:
+                log_line(logfile, "WARN: no prices returned")
+                if once:
+                    return
+                time.sleep(poll)
+                continue
+
+            df = _ensure_utc_datetime_index(df)
+
+            df = strat.enrich(df, strat_params)
+            sig = strat.signal_on_bar_close(df, strat_params)
+
+            if sig is None:
+                if once:
+                    return
+                time.sleep(poll)
+                continue
+
+            # evitar duplicar por la misma vela señal
+            signal_bar_time = df.index[-2]
+            if last_closed_time and signal_bar_time <= last_closed_time:
+                if once:
+                    return
+                time.sleep(poll)
+                continue
+
+            last_closed_time = signal_bar_time
+            st["last_closed_time"] = signal_bar_time.isoformat()
+            save_state(st)
+
+            # =======================
+            # 6) Sizing + 7) niveles
+            # =======================
+            if (cfg.get("engine_overrides") or {}).get("entry_mode") == "SIGNAL_CLOSE":
+                # spec: entry conceptual = close de la vela señal (df.iloc[-2])
+                entry_price = float(df["close"].iloc[-2])
+                entry_time = df.index[-2]
+            else:
+                entry_price = float(df["open"].iloc[-1])        # open del entry_bar (siguiente)
+                entry_time = df.index[-1]        # open del entry_bar (siguiente)
+
+            atr_signal = float(df["atr14"].iloc[-2])        # ATR de la vela señal
+
+            init = strat.initial_risk(entry_price, atr_signal, sig, strat_params)
+            r_points = float(init["r_points"])
+            sl_local = float(init["sl_local"])
+            tp_local = float(init["tp_local"])
+            tp_r_multiple = float(init.get("tp_r_multiple", 3.0))
+
+            size = calc_position_size(
+                bot_equity=bot_equity,
+                risk_pct=risk_pct,
+                r_points=r_points,
+                value_per_point_per_size=vpp,
+            )
+
+            # =======================
+            # 5) Open mercado
+            # =======================
+            log_line(logfile, f"SIGNAL {sig.direction} entry_open={entry_price:.2f} size={size} R={r_points:.2f} TP({tp_r_multiple}R)={tp_local:.2f}")
+            resp = client.open_market(epic, sig.direction, size)
+            email_event(email_enabled, bot_id, "TRADE_OPEN", {
+                "epic": epic,
+                "direction": sig.direction,
+                "size": size,
+                "open_resp": resp,
+                "account_id": account_id,
+            }, logfile)
+
+            deal_ref = (resp or {}).get("dealReference") or (resp or {}).get("deal_reference")
+            if not deal_ref:
+                log_line(logfile, f"ENTRY ERROR no dealReference resp={str(resp)[:250]}")
+                if once:
+                    return
+                time.sleep(poll)
+                continue
+
+            conf = client.confirm(str(deal_ref), timeout_sec=30) or {}
+            deal_id = pick_position_dealid_from_confirm(conf)
+            if not deal_id:
+                log_line(logfile, f"ENTRY ERROR no dealId confirm={str(conf)[:250]}")
+                if once:
+                    return
+                time.sleep(poll)
+                continue
+
+            planned_exit = entry_time + pd.Timedelta(minutes=exit_bars * bar_minutes)
+
+            st["pos"] = {
+                "deal_id": str(deal_id),
+                "direction": sig.direction,
+                "size": float(size),
+                "entry_time_iso": entry_time.isoformat(),
+                "entry_price_est": float(entry_price),
+                "entry_price_api": (conf or {}).get("level"),
+                "r_points": float(r_points),
+                "sl_local": float(sl_local),
+                "tp_local": float(tp_local),
+                "planned_exit_iso": planned_exit.isoformat(),
+                "trail_1r_done": False,
+                "trail_2r_done": False,
+                "meta": sig.meta,
+            }
+            save_state(st)
+
+            email_event(email_enabled, bot_id, "ENTRY_OPENED", {
+                "deal_id": str(deal_id),
+                "direction": sig.direction,
+                "size": size,
+                "entry_price": entry_price,
+                "sl_local": sl_local,
+                "tp_local": tp_local,
+                "planned_exit": planned_exit.isoformat(),
+            }, logfile)
+
+            if once:
+                return
+            time.sleep(poll)
+
+    finally:
+        try:
+            lock.release()
+        except Exception:
+            pass

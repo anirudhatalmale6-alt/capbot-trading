@@ -1,0 +1,169 @@
+from __future__ import annotations
+
+from datetime import datetime
+from html import escape
+from typing import Any, Dict, Tuple
+
+ICON = {
+    "STARTED": "🚀",
+    "HEALTH": "✅",
+    "ENTRY_OPENED": "🟢",
+    "EXIT_TP": "🎯",
+    "EXIT_SL": "🛑",
+    "EXIT_TIME": "⏱️",
+    "EXIT_RTH": "🌙",
+    "TRAIL_SL": "🧷",
+    "ERROR": "⚠️",
+}
+
+MARKET_NAME = {
+    "DE40": "Germany 40",
+    "GER40": "Germany 40",
+    "DAX40": "Germany 40",
+    "DE30": "Germany 30",
+    "GER30": "Germany 30",
+}
+
+def _fmt(v, nd=2):
+    try:
+        if v is None:
+            return "-"
+        return f"{float(v):.{nd}f}"
+    except Exception:
+        return str(v)
+
+def _market_code(v: Any) -> str:
+    if isinstance(v, dict):
+        return str(v.get("epic") or v.get("symbol") or v.get("code") or v.get("name") or "").strip()
+    return str(v or "").strip()
+
+def _market_label(v: Any) -> str:
+    code = _market_code(v)
+    if not code:
+        return "Market"
+    return MARKET_NAME.get(code, code)
+
+def _timeframe_label(v: Any) -> str:
+    if v is None:
+        return ""
+    s = str(v).strip()
+    # ejemplos: MINUTE_5 / MINUTE_1 / 5m / MINUTE_15
+    if s.startswith("MINUTE_"):
+        try:
+            n = int(s.split("_", 1)[1])
+            return f"{n}m"
+        except Exception:
+            return s
+    # ya viene tipo "5m"
+    if s.lower().endswith("m") and s[:-1].isdigit():
+        return s.lower()
+    return s
+
+def subject(event: str, payload: Dict[str, Any], meta: Dict[str, Any]) -> str:
+    market = _market_label(payload.get("market") or meta.get("market"))
+    tf = _timeframe_label(payload.get("timeframe") or payload.get("resolution") or meta.get("timeframe"))
+    # Subject SOLO limpio como pediste
+    base = f"{market} {tf}".strip()
+    return base if base else "CapBot"
+
+def render_email(event: str, payload: Dict[str, Any], meta: Dict[str, Any]) -> Tuple[str, str]:
+    event = str(event or "").strip()
+    payload = payload or {}
+    meta = meta or {}
+
+    ico = ICON.get(event, "📣")
+
+    bot_id = str(payload.get("bot_id") or meta.get("bot_id") or "").strip()
+    market = _market_label(payload.get("market") or meta.get("market"))
+    tf = _timeframe_label(payload.get("timeframe") or payload.get("resolution") or meta.get("timeframe"))
+
+    ts_utc = meta.get("ts_utc") or datetime.utcnow().strftime("%Y-%m-%d %H:%M:%SZ")
+    ts_local = meta.get("ts_local") or meta.get("local_time") or ""
+
+    host = meta.get("host") or ""
+    service = meta.get("service") or ""
+    config_path = payload.get("config_path") or meta.get("config_path") or ""
+    logfile = payload.get("logfile") or meta.get("logfile") or ""
+
+    # Texto plano (fallback)
+    lines = [
+        f"{ico} {event}",
+        f"Bot: {bot_id}",
+        f"Market: {market}",
+        f"Timeframe: {tf}",
+    ]
+    if ts_local:
+        lines.append(f"Time (UTC/Local): {ts_utc} / {ts_local}")
+    else:
+        lines.append(f"Time (UTC): {ts_utc}")
+    if host or service:
+        lines.append(f"Host/Service: {host} / {service}".strip())
+    if config_path:
+        lines.append(f"Config: {config_path}")
+    if logfile:
+        lines.append(f"Log: {logfile}")
+
+    # añade cualquier campo extra interesante sin meter basura gigante
+    EXTRA_KEYS = ("direction","size","entry_price","exit_price","deal_id","reason","pnl_cash","profit_cash","profit_points","sl","tp")
+    for k in EXTRA_KEYS:
+        if k in payload and payload.get(k) is not None:
+            lines.append(f"{k}: {payload.get(k)}")
+
+    text_body = "\n".join(lines)
+
+    def row(k, v):
+        return (
+            "<tr>"
+            f"<td style='padding:10px 12px;color:#667085;white-space:nowrap;border-top:1px solid #eef2f7'>{escape(str(k))}</td>"
+            f"<td style='padding:10px 12px;border-top:1px solid #eef2f7'>{escape(str(v))}</td>"
+            "</tr>"
+        )
+
+    headline = f"{ico} {escape(market)} {escape(tf)} — <span style='color:#111827'>{escape(event)}</span>"
+    subline = escape(bot_id) if bot_id else ""
+
+    rows = []
+    rows.append(row("Bot", bot_id or "-"))
+    rows.append(row("Market", market))
+    rows.append(row("Timeframe", tf or "-"))
+    if ts_local:
+        rows.append(row("Time (UTC / Local)", f"{ts_utc} / {ts_local}"))
+    else:
+        rows.append(row("Time (UTC)", ts_utc))
+    if host or service:
+        rows.append(row("Host / Service", f"{host} / {service}".strip()))
+    if config_path:
+        rows.append(row("Config", config_path))
+    if logfile:
+        rows.append(row("Log", logfile))
+
+    # Extras bonitos
+    for k in EXTRA_KEYS:
+        if k in payload and payload.get(k) is not None:
+            rows.append(row(k, payload.get(k)))
+
+    html_body = f"""<!doctype html>
+<html>
+  <body style="margin:0;padding:20px;background:#f6f7fb;font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Helvetica,Arial,sans-serif;">
+    <div style="max-width:720px;margin:0 auto;">
+      <div style="background:#ffffff;border:1px solid #e6e8f0;border-radius:14px;overflow:hidden;box-shadow:0 8px 30px rgba(16,24,40,.06);">
+        <div style="padding:18px 18px 10px 18px;">
+          <div style="font-size:18px;font-weight:700;color:#111827;line-height:1.2;">{headline}</div>
+          <div style="margin-top:6px;font-size:13px;color:#667085;">{subline}</div>
+        </div>
+
+        <div style="padding:0 18px 18px 18px;">
+          <table style="width:100%;border-collapse:collapse;font-size:14px;">
+            {''.join(rows)}
+ למד</table>
+        </div>
+      </div>
+
+      <div style="margin-top:10px;font-size:12px;color:#98a2b3;">
+        CapBot • {escape(str(host))} • {escape(str(service))}
+      </div>
+    </div>
+  </body>
+</html>
+"""
+    return text_body, html_body
