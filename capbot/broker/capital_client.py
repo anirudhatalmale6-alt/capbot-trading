@@ -1,8 +1,21 @@
+import json
+import os
+import time
+from dataclasses import dataclass
+from typing import Any, Dict, Optional
+
+import requests
+
+
+class CapitalConfigError(RuntimeError):
+    """Configuration error (missing env vars, etc)."""
+
+class CapitalAuthError(RuntimeError):
+    """Authentication / authorization error."""
+
 
 def _get_env_required():
     """Return (api_key, ident, pwd) from environment (Capital.com)."""
-    import os
-
     api_key = os.environ.get("CAPITAL_API_KEY")
     ident   = os.environ.get("CAPITAL_IDENTIFIER")
     pwd     = os.environ.get("CAPITAL_API_PASSWORD")
@@ -14,30 +27,14 @@ def _get_env_required():
     ] if not val]
 
     if missing:
-        raise RuntimeError("Missing Capital env vars: " + ", ".join(missing))
+        raise CapitalConfigError("Missing Capital env vars: " + ", ".join(missing))
 
     return api_key, ident, pwd
 
-import json
-import os
-import time
-from dataclasses import dataclass
-from typing import Any, Dict, Optional
-
-import requests
-
-# ---- runtime safety defs (added by patch) ----
-class CapitalConfigError(RuntimeError):
-    """Configuration error (missing env vars, etc)."""
-    pass
-
-class CapitalAuthError(RuntimeError):
-    """Authentication / authorization error."""
-    pass
 
 def _sleep_backoff(i: int, cap: int = 30) -> None:
-    import time
     time.sleep(min(cap, 2 ** max(0, int(i))))
+
 
 def _has_open_position_for_epic(positions_json, epic: str) -> bool:
     try:
@@ -49,9 +46,7 @@ def _has_open_position_for_epic(positions_json, epic: str) -> bool:
         for p in positions:
             pos = (p or {}).get("position") or {}
             mkt = (p or {}).get("market") or {}
-            ep = None
-            if isinstance(mkt, dict):
-                ep = mkt.get("epic")
+            ep = mkt.get("epic") if isinstance(mkt, dict) else None
             if not ep:
                 ep = pos.get("epic")
             if str(ep) == str(epic):
@@ -59,7 +54,6 @@ def _has_open_position_for_epic(positions_json, epic: str) -> bool:
         return False
     except Exception:
         return False
-# ---- end runtime safety defs ----
 
 
 @dataclass

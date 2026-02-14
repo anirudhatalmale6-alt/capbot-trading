@@ -12,7 +12,7 @@ from typing import Any
 log = logging.getLogger(__name__)
 
 def _json_default(o: Any):
-    # Nunca explotes por tipos raros en payload (Path, datetime, etc)
+    """Safe JSON serializer for non-standard types (Path, datetime, bytes)."""
     try:
         if isinstance(o, Path):
             return str(o)
@@ -32,7 +32,6 @@ def _json_default(o: Any):
     except Exception:
         pass
 
-    # fallback estable
     return str(o)
 # --- STARTUP/SPAM GUARD (only for startup-ish events) ---
 _DEDUPE_PATH = Path("/tmp/capbot_email_dedupe.json")
@@ -136,94 +135,32 @@ def email_event(ok: bool, bot_id: str, event: str, payload: Any, logfile: str = 
             return False
 
 
-        # --- EMAIL TEMPLATE (pretty subject + HTML) with safe fallback ---
-
-
         meta = _build_email_meta(bot_id, event, logfile=logfile, cfg=cfg)
-
-
-
         msg = EmailMessage()
-
-
         msg["To"] = to_addr
-
-
         msg["From"] = from_addr
 
-
-
+        # Try pretty email template, fall back to JSON
         subj = None
-
-
         text_body = None
-
-
         html_body = None
-
-
-
         try:
-
-
             from capbot.notify.email_templates import subject as _tmpl_subject, render_email as _tmpl_render
-
-
             payload_dict = payload if isinstance(payload, dict) else {"payload": payload}
-
-
             subj = _tmpl_subject(str(event), payload_dict, meta)
-
-
             text_body, html_body = _tmpl_render(str(event), str(bot_id), payload_dict, meta)
-
-
         except Exception:
-
-
             subj = f"[{bot_id}] {event} {'OK' if ok else 'FAIL'}"
-
-
             body = {
-
-
-                "ok": ok,
-
-
-                "bot_id": bot_id,
-
-
-                "event": event,
-
-
-                "payload": payload,
-
-
-                "logfile": logfile,
-
-
-                "meta": meta,
-
-
+                "ok": ok, "bot_id": bot_id, "event": event,
+                "payload": payload, "logfile": logfile, "meta": meta,
             }
-
-
             text_body = json.dumps(body, indent=2, ensure_ascii=False, default=_json_default)
-
-
             html_body = None
 
-
-
         msg["Subject"] = subj
-
-
         msg.set_content((text_body or "").strip() + "\n")
-
-
         if html_body:
-
-
             msg.add_alternative(html_body, subtype="html")
         if _should_dedupe_startup(str(bot_id), str(event)):
             log.info("EMAIL_SKIPPED: dedupe %s %s", bot_id, event)
@@ -247,9 +184,7 @@ def email_event(ok: bool, bot_id: str, event: str, payload: Any, logfile: str = 
 
 
 def email_startup(enabled: bool, bot_id: str, body: dict, subject_prefix: str = "") -> bool:
-    # compat wrapper:
-    # - engine pasa el logfile como 4º arg (antes se llamaba subject_prefix)
-    # - fallback: body["logfile"]
+    """Compat wrapper: engine passes logfile as 4th arg (was subject_prefix)."""
     try:
         logfile = ""
         if isinstance(subject_prefix, str) and subject_prefix.strip():

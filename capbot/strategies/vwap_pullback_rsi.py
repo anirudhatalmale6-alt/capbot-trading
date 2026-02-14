@@ -9,7 +9,7 @@ import pandas as pd
 @dataclass
 class Signal:
     direction: str               # "BUY" | "SELL"
-    entry_price_est: float       # para logging; el engine usa open del siguiente bar para entrar
+    entry_price_est: float       # for logging; engine uses next bar open for entry
     meta: Dict[str, Any]
 
 
@@ -45,35 +45,34 @@ def atr_wilder(df: pd.DataFrame, length: int = 14) -> pd.Series:
 
 def vwap_intraday_reset_berlin(df: pd.DataFrame, tz_name: str = "Europe/Berlin") -> pd.Series:
     """
-    VWAP intradía reseteando a las 00:00 Berlin (o tz_name).
-    Soporta:
-      - df.index DatetimeIndex (tz-aware o naive)
-      - o columna df["time"] con timestamps (ISO/datetime)
+    Intraday VWAP that resets at 00:00 local time (tz_name).
+    Supports:
+      - df.index DatetimeIndex (tz-aware or naive)
+      - df["time"] column with timestamps (ISO/datetime)
     """
-    # 1) Obtener timestamps
+    # 1) Get timestamps
     if isinstance(df.index, pd.DatetimeIndex):
         idx = df.index
     elif "time" in df.columns:
-        # ojo: esto devuelve Series -> lo convertimos abajo a DatetimeIndex
         idx = pd.to_datetime(df["time"], errors="coerce")
     else:
-        raise ValueError("VWAP requiere df.index DatetimeIndex o columna 'time'")
+        raise ValueError("VWAP requires df.index DatetimeIndex or 'time' column")
 
-    # 2) Forzar DatetimeIndex siempre
+    # 2) Ensure DatetimeIndex
     if not isinstance(idx, pd.DatetimeIndex):
         idx = pd.DatetimeIndex(idx)
 
-    # 3) Asegurar tz-aware en UTC (sobre el INDEX, no sobre valores)
+    # 3) Ensure tz-aware UTC
     if idx.tz is None:
         idx = idx.tz_localize("UTC")
     else:
         idx = idx.tz_convert("UTC")
 
-    # 4) Día de reseteo en tz local
+    # 4) Day key for intraday reset (local timezone)
     local = idx.tz_convert(tz_name)
     day_key = local.normalize()
 
-    # 5) Typical price y acumulados intradía
+    # 5) Typical price and intraday cumulative sums
     tp = (df["high"].astype(float) + df["low"].astype(float) + df["close"].astype(float)) / 3.0
     vol = df["volume"].astype(float).fillna(0.0)
 
@@ -83,9 +82,8 @@ def vwap_intraday_reset_berlin(df: pd.DataFrame, tz_name: str = "Europe/Berlin")
 
 class VWAPPullbackRSI:
     """
-    Estrategia DE40/GER40 5m — VWAP diario + filtro distancia VWAP (k=0.20)
-    - Señal con vela cerrada (signal_bar = df.iloc[-2])
-    - Entrada en open de la vela siguiente (entry_bar = df.iloc[-1]) -> lo hace el engine
+    VWAP Pullback + RSI strategy (5m bars).
+    Signal on closed bar (df.iloc[-2]); entry on next bar open (handled by engine).
     """
 
     name = "vwap_pullback_rsi"
@@ -104,7 +102,7 @@ class VWAPPullbackRSI:
         d["body_ratio"] = (d["close"] - d["open"]).abs() / rng.replace(0, pd.NA)
         d["body_ratio"] = d["body_ratio"].fillna(0.0)
 
-        # Volumen relativo
+        # Relative volume
         d["vol_sma20"] = d["volume"].rolling(vol_window, min_periods=vol_window).mean()
         d["vol_rel"] = d["volume"] / d["vol_sma20"].replace(0, pd.NA)
 
@@ -118,7 +116,7 @@ class VWAPPullbackRSI:
         d["rsi14"] = rsi_wilder(d["close"].astype(float), rsi_len)
         d["atr14"] = atr_wilder(d, atr_len)
 
-        # VWAP intradía reset 00:00 Berlin
+        # Intraday VWAP (resets at 00:00 local)
         d["vwap"] = vwap_intraday_reset_berlin(d, vwap_tz)
 
         return d
@@ -127,7 +125,7 @@ class VWAPPullbackRSI:
         if df is None or df.empty or len(df) < 50:
             return None
 
-        # signal_bar = última vela CERRADA
+        # signal_bar = last CLOSED candle
         last = df.iloc[-2]
 
         close_px = float(last["close"])
@@ -158,11 +156,11 @@ class VWAPPullbackRSI:
         bear3 = int(last["bear_prev3"])
         bull3 = int(last["bull_prev3"])
 
-        # GATE NUEVO: distancia a VWAP
+        # VWAP distance gate
         if abs(close_px - vwap_px) < (VWAP_DISTANCE_K * atr_v):
             return None
 
-        # Señales
+        # Signal conditions
         cond_long = (close_px > vwap_px) and (bear3 >= BEAR_PREV3_LONG) and (rsi_v <= RSI_LONG_MAX) and (close_px > open_px)
         cond_short = (close_px < vwap_px) and (bull3 >= BULL_PREV3_SHORT) and (rsi_v >= RSI_SHORT_MIN) and (close_px < open_px)
 
@@ -209,10 +207,5 @@ class VWAPPullbackRSI:
             "tp_r_multiple": TP_R_MULTIPLE,
         }
 
-# --- Backward compat: DE40 strategy expects this name ---
-def vwap_daily_berlin(*args, **kwargs):
-    """
-    Compat wrapper. Kept to avoid breaking de40_vwap_k020 import.
-    """
-    # TODO: change the call below to the actual function name found in this module.
-    return vwap_intraday_reset_berlin(*args, **kwargs)
+# Alias for backward compatibility
+vwap_daily_berlin = vwap_intraday_reset_berlin

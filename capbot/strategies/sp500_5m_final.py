@@ -7,21 +7,21 @@ from typing import Any, Optional
 import pandas as pd
 
 
-# Estrategia FINAL SP500 5m (según spec)
-# - Señal en vela cerrada i (engine debe evaluar sobre df.iloc[-2])
-# - Filtros en vela señal i:
-#     * RTH NY 09:30-16:00 (incluye 16:00) y solo weekdays
-#     * "no jueves UTC" SOLO si disable_thursday_utc=True
-# - RSI(14): SMA14(up)/SMA14(down). Si down==0 => RSI inválido (NaN)
+# SP500 5m Final Strategy (per spec)
+# - Signal on closed bar i (engine evaluates df.iloc[-2])
+# - Filters on signal bar i:
+#     * RTH NY 09:30-16:00 (inclusive), weekdays only
+#     * Thursday UTC disabled only if disable_thursday_utc=True
+# - RSI(14): SMA14(up)/SMA14(down). If down==0 => RSI invalid (NaN)
 # - ATR(14): SMA14(TR)
-# - vol_ma20 incluye volume[i] (sin shift)
-# - prev3 excluye vela señal (shift(1))
+# - vol_ma20 includes volume[i] (no shift)
+# - prev3 excludes signal bar (shift(1))
 
 
 @dataclass
 class _Sig:
     direction: str        # "BUY" | "SELL"
-    ts: pd.Timestamp      # timestamp vela señal (UTC)
+    ts: pd.Timestamp      # signal bar timestamp (UTC)
     entry_price: float
     atr_entry: float
 
@@ -50,7 +50,7 @@ class SP500_5M_FINAL:
                 df.index = t
                 return df
 
-        # último recurso: intenta convertir index numérico (epoch s/ms)
+        # Last resort: try converting numeric index (epoch s/ms)
         try:
             v = int(df.index[-1])
             unit = "ms" if v > 10**11 else "s"
@@ -91,7 +91,7 @@ class SP500_5M_FINAL:
         body = body.where(rng > 0)
         df["body_ratio"] = body
 
-        # 3.2 vol_rel (SMA20 incluye volume[i])
+        # 3.2 vol_rel (SMA20 includes volume[i])
         vol_ma20 = v.rolling(20, min_periods=20).mean()
         df["vol_ma20"] = vol_ma20
         df["vol_rel"] = v / vol_ma20.replace(0, pd.NA)
@@ -103,7 +103,7 @@ class SP500_5M_FINAL:
         up_sma = up.rolling(14, min_periods=14).mean()
         down_sma = down.rolling(14, min_periods=14).mean()
 
-        # down==0 => RSI inválido
+        # down==0 => RSI invalid
         rs = up_sma / down_sma.replace(0, pd.NA)
         rsi = 100 - (100 / (1 + rs))
         rsi = rsi.where(down_sma != 0)
@@ -118,7 +118,7 @@ class SP500_5M_FINAL:
         df["tr"] = tr
         df["atr14"] = tr.rolling(14, min_periods=14).mean()
 
-        # 3.5 prev3 excluye vela señal
+        # 3.5 prev3 excludes signal bar
         bear = (c < o).astype("int64")
         bull = (c > o).astype("int64")
         df["bear_prev3"] = bear.shift(1).rolling(3, min_periods=3).sum()
@@ -140,7 +140,7 @@ class SP500_5M_FINAL:
         row = df.iloc[i]
         ts_utc = pd.Timestamp(df.index[i]).tz_convert("UTC")
 
-        # Session filters (vela señal i)
+        # Session filters (signal bar i)
         ts_ny = ts_utc.tz_convert("America/New_York")
         if ts_ny.weekday() >= 5:
             return None
@@ -149,7 +149,7 @@ class SP500_5M_FINAL:
 
         thu_ok = True if (not disable_thursday_utc) else (ts_utc.weekday() != 3)
 
-        # Validaciones
+        # Validate indicators
         o = float(row["open"]); c = float(row["close"]); h = float(row["high"]); l = float(row["low"])
         rng = float(row.get("range", h - l))
         body = float(row.get("body_ratio", float("nan")))
@@ -177,7 +177,7 @@ class SP500_5M_FINAL:
         if not (body >= BODY_MIN and vol_rel >= VOL_REL_MIN):
             return None
 
-        # Condiciones entrada
+        # Entry conditions
         long_ok = (c > o) and (float(bear3) >= 2) and (rsi < RSI_LONG_MAX)
         short_ok = (c < o) and (float(bull3) >= 2) and (rsi > RSI_SHORT_MIN)
 
@@ -190,7 +190,7 @@ class SP500_5M_FINAL:
 
     @staticmethod
     def signal(df: pd.DataFrame, params: dict | None = None) -> Optional[_Sig]:
-        # Si el DF ya viene enriquecido (engine), no recalcular.
+        # If df already has enriched columns (from engine), skip recalculation.
         params = params or {}
 
         needed = {"body_ratio", "vol_rel", "rsi14", "atr14", "bear_prev3", "bull_prev3"}

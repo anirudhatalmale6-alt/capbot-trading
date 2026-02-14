@@ -67,7 +67,7 @@ def _market_and_tf(payload: Dict[str, Any], meta: Dict[str, Any]) -> Tuple[str, 
 
     market_dict = raw_market if isinstance(raw_market, dict) else None
 
-    # Si market viene como dict, intenta sacar un identificador humano
+    # If market is a dict, extract a human-readable identifier
     if isinstance(raw_market, dict):
         raw_market = (
             raw_market.get("label")
@@ -80,7 +80,7 @@ def _market_and_tf(payload: Dict[str, Any], meta: Dict[str, Any]) -> Tuple[str, 
 
     market = str(raw_market).replace("_", " ").strip()
 
-    # Normaliza epic -> nombre bonito
+    # Normalize epic -> display name
     upper = market.upper().replace(" ", "")
     if upper in ("DE40", "GER40", "GERMANY40", "GERMANY40CASH"):
         market = "Germany 40"
@@ -97,7 +97,7 @@ def _market_and_tf(payload: Dict[str, Any], meta: Dict[str, Any]) -> Tuple[str, 
 
     tf = str(tf).strip()
 
-    # Normaliza MINUTE_5 / MINUTE 5 / etc -> 5m
+    # Normalize MINUTE_5 / MINUTE 5 / etc -> 5m
     tfx = tf.upper().replace(" ", "_")
     if tfx.startswith("MINUTE_"):
         try:
@@ -114,7 +114,7 @@ def subject(event: str, payload: Dict[str, Any], meta: Dict[str, Any]) -> str:
     ico = ICON.get(event, "📣")
     label = EVENT_LABEL.get(event, event)
 
-    # si viene ok/failed en payload/meta, pinta ✅/❌ en HEALTH
+    # Show pass/fail icon for HEALTH events
     if event == "HEALTH":
         ok = payload.get("ok")
         if ok is True:
@@ -126,10 +126,7 @@ def subject(event: str, payload: Dict[str, Any], meta: Dict[str, Any]) -> str:
 
 
 def render_email(event: str, bot_id: str, payload: Dict[str, Any], meta: Dict[str, Any]) -> Tuple[str, str]:
-    """
-    Devuelve (text_body, html_body).
-    bot_id se usa para etiqueta, pero NO debe aparecer “feo” en el subject.
-    """
+    """Return (text_body, html_body) for an email notification."""
     market, tf = _market_and_tf(payload, meta)
     ico = ICON.get(event, "📣")
     label = EVENT_LABEL.get(event, event)
@@ -137,7 +134,7 @@ def render_email(event: str, bot_id: str, payload: Dict[str, Any], meta: Dict[st
     # headline
     headline = f"{market} {tf} · {label} {ico}"
 
-    # summary (línea corta arriba)
+    # summary (short line above details)
     summary_bits = []
     direction = payload.get("direction")
     if direction:
@@ -161,7 +158,7 @@ def render_email(event: str, bot_id: str, payload: Dict[str, Any], meta: Dict[st
 
     summary = " · ".join(summary_bits) if summary_bits else ""
 
-    # tabla de detalles (solo cosas útiles)
+    # detail table (only useful fields)
     rows = []
     def add(k: str, v: Any):
         if v is None or v == "" or v == "-":

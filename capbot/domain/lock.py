@@ -53,7 +53,7 @@ class InstanceLock:
                 pid = -1
 
             if pid > 0 and _pid_is_alive(pid):
-                raise RuntimeError(f"Lock activo: {self.path}. PID {pid} sigue vivo.")
+                raise RuntimeError(f"Active lock: {self.path}. PID {pid} is still alive.")
 
             # stale lock -> remove and retry once
             try:
@@ -66,7 +66,7 @@ class InstanceLock:
                 _try_create()
                 return
             except FileExistsError:
-                raise RuntimeError(f"Lock activo: {self.path}. Otro proceso ganó la carrera.")
+                raise RuntimeError(f"Active lock: {self.path}. Another process won the race.")
 
     def release(self) -> None:
         try:

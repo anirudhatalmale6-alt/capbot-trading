@@ -2,14 +2,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Any, Dict, Optional
+from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
-
-try:
-    from zoneinfo import ZoneInfo
-except Exception:  # py<3.9 fallback not expected
-    ZoneInfo = None
 
 
 @dataclass
@@ -34,17 +30,17 @@ class SP5005MSpec:
             if c in d.columns:
                 d[c] = pd.to_numeric(d[c], errors="coerce")
 
-        # 4.1 Body ratio
+        # Body ratio
         rng = d["high"] - d["low"]
         d["range"] = rng
         d["body_ratio"] = (d["close"] - d["open"]).abs() / rng
 
-        # 4.2 Volumen relativo (SMA20 incluyendo vela señal, NO shift)
+        # Relative volume (SMA20 including signal bar, no shift)
         vol_ma20 = d["volume"].rolling(20).mean()
         d["vol_ma20"] = vol_ma20
         d["vol_rel"] = d["volume"] / vol_ma20
 
-        # 4.3 RSI(14) SMA (no Wilder)
+        # RSI(14) SMA (not Wilder)
         delta = d["close"].diff()
         up = delta.clip(lower=0).rolling(14).mean()
         down = (-delta).clip(lower=0).rolling(14).mean()
@@ -52,11 +48,11 @@ class SP5005MSpec:
         rs = up / down
         rsi = 100.0 - (100.0 / (1.0 + rs))
 
-        # Si down == 0 => RSI inválido (no señal)
+        # down==0 => RSI invalid (no signal)
         rsi = rsi.where(down != 0, np.nan)
         d["rsi14"] = rsi
 
-        # 4.4 ATR(14) (TR clásico + SMA14)
+        # ATR(14) (classic TR + SMA14)
         prev_close = d["close"].shift(1)
         tr1 = (d["high"] - d["low"]).abs()
         tr2 = (d["high"] - prev_close).abs()
@@ -65,7 +61,7 @@ class SP5005MSpec:
         d["tr"] = tr
         d["atr14"] = tr.rolling(14).mean()
 
-        # 4.5 Conteo previas (excluye vela señal)
+        # Previous bar count (excludes signal bar)
         bear = (d["close"] < d["open"]).astype(int)
         bull = (d["close"] > d["open"]).astype(int)
         d["bear_prev3"] = bear.shift(1).rolling(3).sum()
@@ -77,25 +73,22 @@ class SP5005MSpec:
         if df is None or getattr(df, "empty", True) or len(df) < 30:
             return None
 
-        # vela señal i = última cerrada
+        # Signal bar = last closed candle
         i = -2
         row = df.iloc[i]
 
-        # time[i] es UTC open time
+        # time[i] is UTC open time
         ts_utc = pd.Timestamp(df.index[i])
         if ts_utc.tzinfo is None:
             ts_utc = ts_utc.tz_localize("UTC")
         else:
             ts_utc = ts_utc.tz_convert("UTC")
 
-        # 3) Gates (evaluados en vela señal i)
-        # No jueves UTC
+        # No Thursday UTC
         if int(ts_utc.weekday()) == 3:
             return None
 
         # RTH NY 09:30..16:00 inclusive
-        if ZoneInfo is None:
-            return None
         ts_ny = ts_utc.tz_convert(ZoneInfo("America/New_York"))
         mins = int(ts_ny.hour) * 60 + int(ts_ny.minute)
         if not (mins >= (9 * 60 + 30) and mins <= (16 * 60 + 0)):
@@ -109,8 +102,8 @@ class SP5005MSpec:
         BEAR_PREV3_LONG = int(params.get("BEAR_PREV3_LONG", 2))
         BULL_PREV3_SHORT = int(params.get("BULL_PREV3_SHORT", 2))
 
-        # Validación indicadores disponibles
-        need = ["range","body_ratio","vol_ma20","vol_rel","rsi14","atr14","bear_prev3","bull_prev3"]
+        # Validate indicators
+        need = ["range", "body_ratio", "vol_ma20", "vol_rel", "rsi14", "atr14", "bear_prev3", "bull_prev3"]
         for k in need:
             v = row.get(k)
             if v is None:
@@ -133,8 +126,7 @@ class SP5005MSpec:
         bear3 = float(row["bear_prev3"])
         bull3 = float(row["bull_prev3"])
 
-        # Entrada siempre al close[i]
-        # entry_time = time[i] (open time)
+        # Entry at close[i]
         meta = {
             "ts_signal_utc": ts_utc.isoformat(),
             "ts_signal_ny": ts_ny.isoformat(),
@@ -152,5 +144,5 @@ class SP5005MSpec:
         return None
 
 
-# loader expects a class named like this in some setups
+# Loader expects a class named like this in some setups
 Strategy = SP5005MSpec
