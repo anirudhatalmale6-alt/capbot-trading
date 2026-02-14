@@ -34,11 +34,11 @@ def _tail(path: str, n: int = 1) -> str:
 
 
 def main() -> int:
-    bot_id = _env("HEALTH_BOT_ID", "germany40_5m_vwap")
-    market = _env("HEALTH_MARKET", "Germany 40 5m").replace("_", " ").strip()
+    bot_id = _env("HEALTH_BOT_ID", "de40_5m_vwap")
+    market = _env("HEALTH_MARKET", "DE40 5m").replace("_", " ").strip()
     tz = _env("HEALTH_TZ", "Europe/Berlin")
-    service = _env("HEALTH_SERVICE", "capbot-germany40.service")
-    logfile = _env("HEALTH_LOGFILE", "/home/ubuntu/capbot_events_germany40_5m_vwap.log")
+    service = _env("HEALTH_SERVICE", "capbot@de40_5m_vwap.service")
+    logfile = _env("HEALTH_LOGFILE", "/home/ubuntu/capbot_events_de40_5m_vwap.log")
     max_age_min = float(_env("HEALTH_MAX_AGE_MIN", "10") or "10")
 
     now = datetime.now(timezone.utc)

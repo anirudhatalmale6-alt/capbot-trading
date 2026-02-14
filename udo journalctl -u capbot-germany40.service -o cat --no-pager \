@@ -1,4 +1,0 @@
-NRestarts=0
-ExecMainCode=0
-ExecMainStatus=0
-ExecStart={ path=/opt/capbot_full/.venv/bin/python ; argv[]=/opt/capbot_full/.venv/bin/python -m capbot.app.main run --config configs/germany40_5m_vwap.json --secrets /etc/capbot/germany40.secrets ; ignore_errors=no ; start_time=[Thu 2026-01-29 12:17:27 UTC] ; stop_time=[n/a] ; pid=2664498 ; code=(null) ; status=0/0 }
