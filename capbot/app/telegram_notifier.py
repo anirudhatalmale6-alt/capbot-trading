@@ -66,6 +66,24 @@ def _format_event(bot_id: str, event: str, payload: dict) -> str:
     elif event == "STARTUP":
         lines.append(f"Bot started: {payload.get('epic', '?')} {payload.get('resolution', '?')}")
 
+    elif event == "DAILY_SUMMARY":
+        trades = payload.get("trades", 0)
+        if trades == 0:
+            lines.append("No trades today")
+        else:
+            lines.append(f"Trades: {trades} | W/L: {payload.get('wins',0)}/{payload.get('losses',0)}")
+            lines.append(f"Win rate: {payload.get('win_rate','?')} | PnL: {payload.get('total_pnl','?')}")
+
+    elif event == "WATCHDOG_ALERT":
+        lines.append(f"\u26a0\ufe0f Loop stalled for {payload.get('elapsed_sec',0)}s!")
+
+    elif event == "FILL_TIMEOUT":
+        lines.append(f"\u26a0\ufe0f Order fill timeout ({payload.get('elapsed_sec',0)}s)")
+        lines.append(f"Action: {payload.get('action','?')} deal={payload.get('deal_id','?')}")
+
+    elif event == "EXIT_SHUTDOWN":
+        lines.append(f"\U0001f6d1 Position closed on shutdown")
+
     elif event == "HEALTH":
         for k, v in (payload or {}).items():
             lines.append(f"  {k}: {v}")

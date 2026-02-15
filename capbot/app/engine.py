@@ -7,8 +7,10 @@ import os
 import math
 import inspect
 import json
+import signal
+import threading
 
-ENGINE_BUILD_TAG = "20260213_refactor_v2"
+ENGINE_BUILD_TAG = "20260215_engine_v3"
 
 # ──────────────────────────────────────────────────
 # Imports
@@ -464,6 +466,167 @@ def _handle_position_exit(client, st, pos, deal_id, direction, reason, exit_pric
     return conf
 
 
+# ──────────────────────────────────────────────────
+# Graceful shutdown
+# ──────────────────────────────────────────────────
+
+class _ShutdownRequested(Exception):
+    """Raised inside the main loop when SIGTERM/SIGINT is received."""
+
+_shutdown_flag = threading.Event()
+
+def _install_signal_handlers(logfile: str):
+    """Install SIGTERM/SIGINT handlers that set the shutdown flag."""
+    def _handler(signum, frame):
+        name = signal.Signals(signum).name
+        log_line(logfile, f"SHUTDOWN: received {name}, shutting down gracefully...")
+        _shutdown_flag.set()
+    signal.signal(signal.SIGTERM, _handler)
+    signal.signal(signal.SIGINT, _handler)
+
+
+# ──────────────────────────────────────────────────
+# Heartbeat watchdog
+# ──────────────────────────────────────────────────
+
+class _Watchdog:
+    """Background thread that alerts if the main loop hasn't ticked recently."""
+
+    def __init__(self, timeout_sec: int, bot_id: str, logfile: str, email_enabled: bool):
+        self._timeout = max(60, timeout_sec)
+        self._bot_id = bot_id
+        self._logfile = logfile
+        self._email_enabled = email_enabled
+        self._last_tick = time.monotonic()
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._alerted = False
+        self._thread = threading.Thread(target=self._run, daemon=True, name="watchdog")
+
+    def start(self):
+        self._thread.start()
+
+    def tick(self):
+        with self._lock:
+            self._last_tick = time.monotonic()
+            self._alerted = False
+
+    def stop(self):
+        self._stop.set()
+
+    def _run(self):
+        while not self._stop.wait(30):
+            with self._lock:
+                elapsed = time.monotonic() - self._last_tick
+                already_alerted = self._alerted
+            if elapsed > self._timeout and not already_alerted:
+                with self._lock:
+                    self._alerted = True
+                msg = f"WATCHDOG: main loop stalled for {int(elapsed)}s (threshold {self._timeout}s)"
+                log_line(self._logfile, msg)
+                email_event(self._email_enabled, self._bot_id, "WATCHDOG_ALERT", {
+                    "elapsed_sec": int(elapsed), "threshold_sec": self._timeout,
+                }, self._logfile)
+                telegram_event(self._bot_id, "WATCHDOG_ALERT", {
+                    "elapsed_sec": int(elapsed), "threshold_sec": self._timeout,
+                })
+
+
+# ──────────────────────────────────────────────────
+# Config hot-reload
+# ──────────────────────────────────────────────────
+
+def _check_config_reload(config_path: str, last_mtime: float, logfile: str):
+    """Check if config file changed. Returns (new_cfg_dict_or_None, new_mtime)."""
+    try:
+        mtime = os.path.getmtime(config_path)
+        if mtime > last_mtime:
+            from capbot.app.config import load_config
+            cfg = load_config(config_path).raw
+            log_line(logfile, f"CONFIG_RELOAD: detected change in {config_path}")
+            return cfg, mtime
+    except Exception as e:
+        log_line(logfile, f"CONFIG_RELOAD warning: {repr(e)}")
+    return None, last_mtime
+
+
+def _apply_hot_config(cfg: Dict[str, Any], logfile: str):
+    """Extract hot-reloadable params from config. Returns dict of updated values."""
+    reloaded = {}
+
+    risk = cfg.get("risk") or {}
+    reloaded["bot_equity"] = float(risk.get("bot_equity", 25000.0))
+    reloaded["risk_pct"] = float(risk.get("risk_pct", 0.02))
+
+    trail = cfg.get("trailing") or {}
+    reloaded["trailing_on"] = bool(trail.get("enabled", True))
+    reloaded["trail_buffer_r"] = float(trail.get("buffer_r", 0.10))
+
+    cb = cfg.get("circuit_breaker") or {}
+    reloaded["cb_losses"] = int(cb.get("losses", 3))
+    reloaded["cb_cooldown"] = int(cb.get("cooldown_min", 60))
+
+    strat = cfg.get("strategy") or {}
+    reloaded["strat_params"] = strat.get("params") or {}
+
+    reloaded["poll"] = int(cfg.get("poll_seconds", 30))
+
+    log_line(logfile, f"CONFIG_RELOAD: applied new params equity={reloaded['bot_equity']} risk={reloaded['risk_pct']} poll={reloaded['poll']}s")
+    return reloaded
+
+
+# ──────────────────────────────────────────────────
+# Daily trade summary
+# ──────────────────────────────────────────────────
+
+def _send_daily_summary(csv_path, bot_id, epic, email_enabled, logfile):
+    """Parse today's trades from CSV and send summary via email/telegram."""
+    import csv as _csv
+    from datetime import datetime, timezone
+
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    trades = []
+
+    try:
+        with open(csv_path, "r", encoding="utf-8") as f:
+            reader = _csv.DictReader(f)
+            for row in reader:
+                exit_time = row.get("exit_time") or ""
+                if today in exit_time:
+                    trades.append(row)
+    except Exception:
+        trades = []
+
+    total = len(trades)
+    if total == 0:
+        summary = {"trades": 0, "message": "No trades today"}
+    else:
+        wins = 0
+        total_pnl = 0.0
+        for t in trades:
+            try:
+                pnl = float(t.get("profit_ccy") or t.get("profit_api") or 0)
+                total_pnl += pnl
+                if pnl > 0:
+                    wins += 1
+            except Exception:
+                pass
+        win_rate = (wins / total * 100) if total > 0 else 0
+        summary = {
+            "trades": total,
+            "wins": wins,
+            "losses": total - wins,
+            "win_rate": f"{win_rate:.0f}%",
+            "total_pnl": f"${total_pnl:.2f}",
+            "epic": epic,
+            "date": today,
+        }
+
+    log_line(logfile, f"DAILY_SUMMARY: {summary}")
+    email_event(email_enabled, bot_id, "DAILY_SUMMARY", summary, logfile)
+    telegram_event(bot_id, "DAILY_SUMMARY", summary)
+
+
 def _wait_seconds_until_next_bar(bar_minutes: int) -> float:
     """Calculate seconds to wait until next bar close + small buffer."""
     now = pd.Timestamp.now(tz="UTC")
@@ -561,19 +724,77 @@ def run_bot(cfg: Dict[str, Any], once: bool = False):
     # ── Align poll to bar close ──
     align_poll = bool(cfg.get("align_poll_to_bar", True))
 
+    # ── Config hot-reload tracking ──
+    config_path = cfg.get("_config_path") or ""
+    config_mtime = os.path.getmtime(config_path) if config_path and os.path.exists(config_path) else 0.0
+
+    # ── Graceful shutdown ──
+    _shutdown_flag.clear()
+    _install_signal_handlers(logfile)
+
     client = CapitalClient()
     email_startup(email_enabled, bot_id, cfg, logfile)
     telegram_event(bot_id, "STARTUP", {"epic": epic, "resolution": resolution})
 
     last_closed_time = _as_ts(st.get("last_closed_time"))
 
-    log_line(logfile, f"BOT_START epic={epic} res={resolution} warmup={warmup} poll={poll}s align={align_poll}")
+    # ── Heartbeat watchdog ──
+    watchdog_timeout = int(cfg.get("watchdog_timeout_sec", bar_minutes * 60 * 3))
+    watchdog = _Watchdog(watchdog_timeout, bot_id, logfile, email_enabled)
+    if not once:
+        watchdog.start()
+
+    log_line(logfile, f"BOT_START epic={epic} res={resolution} warmup={warmup} poll={poll}s align={align_poll} watchdog={watchdog_timeout}s")
 
     # ══════════════════════════════════════════════
     # MAIN LOOP
     # ══════════════════════════════════════════════
     while True:
         now = utc_now()
+
+        # ── Graceful shutdown check ──
+        if _shutdown_flag.is_set():
+            log_line(logfile, "SHUTDOWN: graceful shutdown initiated")
+            pos = st.get("pos") or {}
+            deal_id = pos.get("deal_id")
+            if deal_id:
+                direction = str(pos.get("direction", "")).upper()
+                log_line(logfile, f"SHUTDOWN: closing open position deal_id={deal_id}")
+                try:
+                    px = client.get_prices(epic, resolution, max_points=10)
+                    df_shut = prices_to_df(px)
+                    exit_price = float(df_shut["close"].iloc[-1]) if df_shut is not None and len(df_shut) > 0 else 0.0
+                except Exception:
+                    exit_price = float(pos.get("entry_price_est", 0))
+                _handle_position_exit(
+                    client, st, pos, deal_id, direction, "EXIT_SHUTDOWN", exit_price,
+                    csv_path, bot_id, epic, vpp, cb_losses, cb_cooldown,
+                    email_enabled, logfile, now,
+                )
+                save_state(st)
+            else:
+                log_line(logfile, "SHUTDOWN: no open position, clean exit")
+            watchdog.stop()
+            lock.release()
+            log_line(logfile, "SHUTDOWN: complete")
+            return
+
+        # ── Watchdog tick ──
+        watchdog.tick()
+
+        # ── Config hot-reload ──
+        if config_path:
+            new_cfg, config_mtime = _check_config_reload(config_path, config_mtime, logfile)
+            if new_cfg:
+                hot = _apply_hot_config(new_cfg, logfile)
+                bot_equity = hot["bot_equity"]
+                risk_pct = hot["risk_pct"]
+                trailing_on = hot["trailing_on"]
+                trail_buffer_r = hot["trail_buffer_r"]
+                cb_losses = hot["cb_losses"]
+                cb_cooldown = hot["cb_cooldown"]
+                strat_params = hot["strat_params"]
+                poll = hot["poll"]
 
         # ── Heartbeat at RTH open ──
         try:
@@ -595,6 +816,21 @@ def run_bot(cfg: Dict[str, Any], once: bool = False):
                         save_state(st)
         except Exception as e:
             log_line(logfile, f"HEARTBEAT warning: {repr(e)}")
+
+        # ── Daily summary at RTH close ──
+        try:
+            now_local = now.tz_convert(tz_name)
+            if now_local.weekday() < 5:
+                eh, em = map(int, rth_end.split(":"))
+                if now_local.hour == eh and now_local.minute == em:
+                    summary_date = st.get("daily_summary_sent_date")
+                    today = now_local.date().isoformat()
+                    if summary_date != today:
+                        _send_daily_summary(csv_path, bot_id, epic, email_enabled, logfile)
+                        st["daily_summary_sent_date"] = today
+                        save_state(st)
+        except Exception as e:
+            log_line(logfile, f"DAILY_SUMMARY warning: {repr(e)}")
 
         # ── Login + account ──
         try:
@@ -954,13 +1190,17 @@ def run_bot(cfg: Dict[str, Any], once: bool = False):
         resp = client.open_market(epic, sig.direction, size)
         log_line(logfile, f"OPEN_MARKET resp={str(resp)[:300]}")
 
-        # ── Confirm position opened ──
+        # ── Confirm position opened (with hard timeout) ──
         deal_ref = (resp or {}).get("dealReference") or (resp or {}).get("deal_reference")
+        fill_timeout = int((cfg.get("engine_overrides") or {}).get("fill_timeout_sec", 45))
+        fill_t0 = time.monotonic()
 
         # Method 1: Poll broker positions (fast, ~3s)
         confirmed_via_broker = False
         broker_deal_id = None
         for _i in range(10):
+            if time.monotonic() - fill_t0 > fill_timeout:
+                break
             time.sleep(0.3)
             bp = _extract_open_position_for_epic(client, epic)
             if bp:
@@ -971,9 +1211,11 @@ def run_bot(cfg: Dict[str, Any], once: bool = False):
         # Method 2: Confirm via deal reference
         deal_id = broker_deal_id
         conf = {}
-        if deal_ref:
+        if deal_ref and (time.monotonic() - fill_t0 < fill_timeout):
             for _i in range(3):
-                conf = client.confirm(str(deal_ref), timeout_sec=30) or {}
+                if time.monotonic() - fill_t0 > fill_timeout:
+                    break
+                conf = client.confirm(str(deal_ref), timeout_sec=min(15, fill_timeout)) or {}
                 did = pick_position_dealid_from_confirm(conf)
                 if did:
                     deal_id = did
@@ -992,8 +1234,26 @@ def run_bot(cfg: Dict[str, Any], once: bool = False):
                 deal_id = bp.get("deal_id")
                 log_line(logfile, f"CONFIRM_LAST_RESORT: found deal_id={deal_id}")
 
+        # Hard timeout: if still no deal_id, check if position exists and force-close
+        fill_elapsed = time.monotonic() - fill_t0
+        if not deal_id and fill_elapsed >= fill_timeout:
+            log_line(logfile, f"FILL_TIMEOUT: {int(fill_elapsed)}s elapsed, checking for orphan position")
+            orphan = _extract_open_position_for_epic(client, epic)
+            if orphan:
+                orphan_id = orphan.get("deal_id")
+                log_line(logfile, f"FILL_TIMEOUT: force-closing orphan deal_id={orphan_id}")
+                safe_close_position(client, orphan_id)
+                email_event(email_enabled, bot_id, "FILL_TIMEOUT", {
+                    "action": "force_closed", "deal_id": orphan_id,
+                    "elapsed_sec": int(fill_elapsed),
+                }, logfile)
+                telegram_event(bot_id, "FILL_TIMEOUT", {
+                    "action": "force_closed", "deal_id": orphan_id,
+                    "elapsed_sec": int(fill_elapsed),
+                })
+
         if not deal_id:
-            log_line(logfile, f"ENTRY ERROR: no deal_id. resp={str(resp)[:250]} conf={str(conf)[:250]}")
+            log_line(logfile, f"ENTRY ERROR: no deal_id after {int(fill_elapsed)}s. resp={str(resp)[:250]} conf={str(conf)[:250]}")
             last_closed_time = signal_bar_time
             st["last_closed_time"] = signal_bar_time.isoformat()
             save_state(st)

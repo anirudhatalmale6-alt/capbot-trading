@@ -17,6 +17,10 @@ ICON = {
     "EXIT_RTH": "🌙",
     "TRADE_CLOSE": "🏁",
     "TRAIL_SL": "🧷",
+    "EXIT_SHUTDOWN": "🛑",
+    "DAILY_SUMMARY": "📊",
+    "WATCHDOG_ALERT": "⚠️",
+    "FILL_TIMEOUT": "⚠️",
     "ERROR": "⚠️",
 }
 
@@ -33,6 +37,10 @@ EVENT_LABEL = {
     "EXIT_RTH": "EXIT (RTH)",
     "TRADE_CLOSE": "EXIT",
     "TRAIL_SL": "TRAIL SL",
+    "EXIT_SHUTDOWN": "EXIT (SHUTDOWN)",
+    "DAILY_SUMMARY": "DAILY SUMMARY",
+    "WATCHDOG_ALERT": "WATCHDOG",
+    "FILL_TIMEOUT": "FILL TIMEOUT",
     "ERROR": "ERROR",
 }
 

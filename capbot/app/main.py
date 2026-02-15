@@ -27,6 +27,7 @@ def main():
     if args.cmd == "run":
         load_secrets(args.secrets)
         cfg = load_config(args.config).raw
+        cfg["_config_path"] = os.path.abspath(args.config)
         run_bot(cfg, once=bool(args.once))
 
 if __name__ == "__main__":
