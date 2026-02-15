@@ -180,4 +180,5 @@ class DE40VWAPK020:
             "sl_local": float(sl),
             "tp_local": float(tp),
             "tp_r_multiple": float(TP_R_MULTIPLE),
+            "exit_bars": 24,
         }

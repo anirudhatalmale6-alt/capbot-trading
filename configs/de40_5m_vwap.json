@@ -72,6 +72,8 @@
   "align_poll_to_bar": true,
   "watchdog_timeout_sec": 900,
   "engine_overrides": {
+    "trailing_mode": "option_a",
+    "rth_exit": true,
     "fill_timeout_sec": 45
   }
 }

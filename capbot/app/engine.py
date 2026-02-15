@@ -331,49 +331,22 @@ def _ok(x):
 def _compute_vis_checks(df, strat_params, rth, rth_enabled, tz_name, now,
                         disable_thursday_utc, no_trade_hours, st):
     """
-    Compute visual CHECK line from enriched df. Returns formatted log string.
-    Uses the LAST CLOSED bar (iloc[-2]).
+    Compute visual CHECK line from enriched df. Strategy-agnostic.
+    Shows: time | gates (check/X) | key indicators | LONG/SHORT | ENTRY
     """
     if df is None or getattr(df, "empty", True) or len(df) < 2:
-        return "CHECK t(CLOSED)=NA | (no data)"
+        return "CHECK | (no data)"
 
     i = -2
     row = df.iloc[i]
 
     try:
-        t_closed = _to_utc_ts(df.index[i]).isoformat()
+        t_closed = _to_utc_ts(df.index[i]).strftime("%H:%M")
     except Exception:
-        t_closed = str(df.index[i])
+        t_closed = "?"
 
     close = float(row.get("close", float("nan")))
-    open_ = float(row.get("open", float("nan")))
-    body = float(row.get("body_ratio", float("nan")))
-    volr = float(row.get("vol_rel", float("nan")))
     rsi = float(row.get("rsi14", float("nan")))
-    atr = float(row.get("atr14", float("nan")))
-    vwap = float(row.get("vwap", float("nan")))
-    bear3 = row.get("bear_prev3", None)
-    bull3 = row.get("bull_prev3", None)
-
-    p_ = strat_params or {}
-    BODY_MIN = float(p_.get("BODY_MIN", 0.70))
-    VOL_REL_MIN = float(p_.get("VOL_REL_MIN", 0.70))
-    RSI_LONG_MAX = float(p_.get("RSI_LONG_MAX", 75.0))
-    RSI_SHORT_MIN = float(p_.get("RSI_SHORT_MIN", 40.0))
-    BEAR3_LONG = float(p_.get("BEAR_PREV3_LONG", 2))
-    BULL3_SHORT = float(p_.get("BULL_PREV3_SHORT", 2))
-    VWAP_K = float(p_.get("VWAP_DISTANCE_K", 0.20))
-
-    valid = all(_isnum(x) for x in [close, open_, body, volr, rsi, atr, vwap]) and bear3 is not None and bull3 is not None
-
-    body_ok = bool(valid and body >= BODY_MIN)
-    vol_ok = bool(valid and volr >= VOL_REL_MIN)
-
-    dist = float("nan")
-    dist_ok = False
-    if valid:
-        dist = abs(close - vwap)
-        dist_ok = bool(dist >= (VWAP_K * atr))
 
     # Gates
     thu_block = bool(disable_thursday_utc and now.weekday() == 3)
@@ -383,27 +356,56 @@ def _compute_vis_checks(df, strat_params, rth, rth_enabled, tz_name, now,
         nth_block = int(now_local.hour) in set(int(x) for x in no_trade_hours)
     except Exception:
         nth_block = False
-
     cooldown_until = _as_ts((st or {}).get("cooldown_until_iso"))
     cooldown_block = bool(cooldown_until and now < cooldown_until)
 
-    long_ok = bool(valid and dist_ok and (close > vwap) and (close > open_) and (float(bear3) >= BEAR3_LONG) and (rsi <= RSI_LONG_MAX))
-    short_ok = bool(valid and dist_ok and (close < vwap) and (close < open_) and (float(bull3) >= BULL3_SHORT) and (rsi >= RSI_SHORT_MIN))
+    gates = f"rth={_ok(rth_ok)} day={_ok(not thu_block)} cd={_ok(not cooldown_block)}"
 
-    gates_ok = (not thu_block) and rth_ok and (not nth_block) and (not cooldown_block) and valid and body_ok and vol_ok
-    entry_ok = gates_ok and (long_ok or short_ok)
+    # Strategy-specific indicators (show what's available)
+    indicators = []
+    indicators.append(f"close={close:.2f}")
+    if _isnum(rsi):
+        indicators.append(f"rsi={rsi:.1f}")
 
-    dist_fmt = f"{abs(dist):.2f}" if _isnum(dist) else "nan"
-    thr_fmt = f"{VWAP_K * atr:.2f}" if _isnum(atr) else "nan"
+    # VWAP-based (DE40, SP500 5m)
+    vwap = row.get("vwap")
+    if vwap is not None and _isnum(float(vwap)):
+        indicators.append(f"vwap={float(vwap):.1f}")
 
-    return (
-        f"CHECK t(CLOSED)={t_closed} | "
-        f"GATES thu={_ok(not thu_block)} rth={_ok(rth_ok)} nth={_ok(not nth_block)} cd={_ok(not cooldown_block)} | "
-        f"body={body:.3f}{_ok(body_ok)} vol={volr:.3f}{_ok(vol_ok)} "
-        f"dist={dist_fmt}>={thr_fmt}{_ok(dist_ok)} | "
-        f"close={close:.2f} vwap={vwap:.1f} rsi={rsi:.1f} atr={atr:.2f} bear3={bear3} bull3={bull3} | "
-        f"LONG={_ok(long_ok)} SHORT={_ok(short_ok)} | ==> ENTRY {_ok(entry_ok)}"
-    )
+    # Bollinger-based (META, NVDA)
+    bb_low = row.get("bb_low_20")
+    bb_up = row.get("bb_up_20")
+    bb_mid = row.get("bb_mid_20")
+    if bb_low is not None and _isnum(float(bb_low)):
+        indicators.append(f"bb=[{float(bb_low):.1f}|{float(bb_mid):.1f}|{float(bb_up):.1f}]")
+
+    # Regime filter (NVDA)
+    regime = row.get("regime_ok")
+    if regime is not None:
+        indicators.append(f"regime={_ok(bool(int(regime)))}")
+
+    # SMA trend (SP500 1h)
+    sma50 = row.get("sma50")
+    sma200 = row.get("sma200")
+    if sma50 is not None and sma200 is not None and _isnum(float(sma50)):
+        trend_ok = close > float(sma50) and float(sma50) > float(sma200)
+        indicators.append(f"trend={_ok(trend_ok)}")
+
+    # Body/vol (DE40, SP500 5m)
+    body = row.get("body_ratio")
+    volr = row.get("vol_rel")
+    if body is not None and _isnum(float(body)):
+        p_ = strat_params or {}
+        body_ok = float(body) >= float(p_.get("BODY_MIN", 0.70))
+        indicators.append(f"body={_ok(body_ok)}")
+    if volr is not None and _isnum(float(volr)):
+        p_ = strat_params or {}
+        vol_ok = float(volr) >= float(p_.get("VOL_REL_MIN", 0.70))
+        indicators.append(f"vol={_ok(vol_ok)}")
+
+    ind_str = " ".join(indicators)
+
+    return f"CHECK {t_closed} | {gates} | {ind_str}"
 
 
 def _handle_position_exit(client, st, pos, deal_id, direction, reason, exit_price,
@@ -718,8 +720,12 @@ def run_bot(cfg: Dict[str, Any], once: bool = False):
     account_id = account_cfg.get("account_id") or os.environ.get("CAPITAL_ACCOUNT_ID")
 
     # ── Engine mode ──
-    mode = (cfg.get("engine_overrides") or {}).get("mode")
+    overrides = cfg.get("engine_overrides") or {}
+    mode = overrides.get("mode")
     is_sp500_spec = (mode == "sp500_5m_spec")
+    trailing_mode = overrides.get("trailing_mode", "sp500_spec" if is_sp500_spec else "option_a")
+    rth_exit_enabled = overrides.get("rth_exit", not is_sp500_spec)
+    tp_first = is_sp500_spec or (overrides.get("exit_priority") == "TP_FIRST")
 
     # ── Align poll to bar close ──
     align_poll = bool(cfg.get("align_poll_to_bar", True))
@@ -899,7 +905,7 @@ def run_bot(cfg: Dict[str, Any], once: bool = False):
             direction = str(pos.get("direction")).upper()
 
             # ── Exit outside RTH ──
-            if (not is_sp500_spec) and rth_enabled and (not _rth_is_open(rth, now)):
+            if rth_exit_enabled and rth_enabled and (not _rth_is_open(rth, now)):
                 _handle_position_exit(
                     client, st, pos, deal_id, direction, "EXIT_RTH", close_px,
                     csv_path, bot_id, epic, vpp, cb_losses, cb_cooldown,
@@ -930,7 +936,6 @@ def run_bot(cfg: Dict[str, Any], once: bool = False):
             hit_tp = (direction == "BUY" and bar_high >= tp_local) or (direction == "SELL" and bar_low <= tp_local)
 
             if hit_sl or hit_tp:
-                tp_first = is_sp500_spec or (((cfg.get("engine_overrides") or {}).get("exit_priority")) == "TP_FIRST")
                 if tp_first:
                     if hit_tp:
                         reason, exit_price = "EXIT_TP", float(tp_local)
@@ -954,25 +959,29 @@ def run_bot(cfg: Dict[str, Any], once: bool = False):
                     time.sleep(poll)
                     continue
 
-            # ── TIME_EXIT for sp500_5m_spec (2h = 24 bars) ──
-            if is_sp500_spec:
+            # ── TIME_EXIT (generic: uses exit_bars from position state) ──
+            pos_exit_bars = int(pos.get("exit_bars", 0))
+            if is_sp500_spec and pos_exit_bars == 0:
+                pos_exit_bars = 24  # backward compat: SP500 5m = 24 bars (2h)
+            if pos_exit_bars > 0:
                 try:
                     entry_bar_iso = pos.get("entry_bar_time_utc") or pos.get("ts_signal_utc") or pos.get("entry_time_utc")
                     if entry_bar_iso:
                         entry_bar = _to_utc_ts(entry_bar_iso)
                         bar_t_ts = _to_utc_ts(bar_t)
-                        if bar_t_ts >= entry_bar + pd.Timedelta(minutes=120):
+                        exit_minutes = pos_exit_bars * bar_minutes
+                        if bar_t_ts >= entry_bar + pd.Timedelta(minutes=exit_minutes):
                             _handle_position_exit(
                                 client, st, pos, deal_id, direction, "TIME_EXIT", close_px,
                                 csv_path, bot_id, epic, vpp, cb_losses, cb_cooldown,
-                                email_enabled, logfile, now, mode_sp500=True,
+                                email_enabled, logfile, now, mode_sp500=is_sp500_spec,
                             )
                             save_state(st)
                 except Exception as e:
                     log_line(logfile, f"TIME_EXIT warning: {repr(e)}")
 
             # ── Trailing stop ──
-            if is_sp500_spec:
+            if trailing_mode == "sp500_spec":
                 try:
                     atr_entry = float(pos.get("atr_entry_const") or pos.get("atr_entry") or pos.get("atr_signal") or 0.0)
                     entry_est = float(pos.get("entry_price_est"))
@@ -997,7 +1006,7 @@ def run_bot(cfg: Dict[str, Any], once: bool = False):
                         email_event(email_enabled, bot_id, "TRAIL_SL", {"deal_id": deal_id, "sl_local": new_sl, "be_armed": be_armed}, logfile)
                 except Exception as e:
                     log_line(logfile, f"TRAIL warning (sp500): {repr(e)}")
-            elif trailing_on:
+            elif trailing_mode == "option_a" and trailing_on:
                 try:
                     moved, new_sl, flags = maybe_trail_option_a(
                         direction=direction,
@@ -1124,6 +1133,7 @@ def run_bot(cfg: Dict[str, Any], once: bool = False):
         sig = strat.signal_on_bar_close(df, strat_params)
 
         if sig is None:
+            log_line(logfile, "SIGNAL: none")
             if once:
                 return
             # Align poll to next bar close for faster detection
@@ -1268,6 +1278,8 @@ def run_bot(cfg: Dict[str, Any], once: bool = False):
 
         broker_snap_open = _fetch_broker_open_snap(client, epic, str(deal_id))
 
+        exit_bars = int(init.get("exit_bars", 0))
+
         st["pos"] = {
             "deal_id": str(deal_id),
             "direction": sig.direction,
@@ -1283,6 +1295,7 @@ def run_bot(cfg: Dict[str, Any], once: bool = False):
             "trail_2r_done": False,
             "entry_bar_time_utc": str(entry_time),
             "ts_signal_utc": str(signal_bar_time),
+            "exit_bars": exit_bars,
             "broker_snap_open": broker_snap_open,
         }
         save_state(st)

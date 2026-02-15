@@ -160,4 +160,5 @@ class US500_5m_SMA_SPEC:
             "r_points": r_points,
             "sl_local": float(sl),
             "tp_local": float(tp),
+            "exit_bars": 24,
         }

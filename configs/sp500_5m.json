@@ -1,0 +1,50 @@
+{
+  "bot_id": "sp500_5m",
+  "account": {
+    "account_id": "306142202253628574"
+  },
+  "market": {
+    "epic": "US500",
+    "resolution": "MINUTE_5",
+    "warmup_bars": 600
+  },
+  "strategy": {
+    "module": "capbot.strategies.us500_5m_sma_spec:US500_5m_SMA_SPEC",
+    "params": {}
+  },
+  "risk": {
+    "bot_equity": 25000,
+    "risk_pct": 0.02,
+    "value_per_point_per_size": 1.0
+  },
+  "schedule": {
+    "timezone": "America/New_York",
+    "rth_enabled": true,
+    "rth_start": "09:30",
+    "rth_end": "16:00",
+    "disable_thursday_utc": true,
+    "no_trade_hours_berlin": []
+  },
+  "trailing": {
+    "enabled": true,
+    "buffer_r": 0.10
+  },
+  "circuit_breaker": {
+    "losses": 3,
+    "cooldown_min": 60
+  },
+  "notifications": {
+    "email_enabled": true
+  },
+  "poll_seconds": 30,
+  "align_poll_to_bar": true,
+  "watchdog_timeout_sec": 900,
+  "engine_overrides": {
+    "mode": "sp500_5m_spec",
+    "entry_mode": "SIGNAL_CLOSE",
+    "exit_priority": "TP_FIRST",
+    "trailing_mode": "sp500_spec",
+    "rth_exit": false,
+    "fill_timeout_sec": 45
+  }
+}

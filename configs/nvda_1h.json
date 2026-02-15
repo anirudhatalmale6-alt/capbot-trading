@@ -1,0 +1,50 @@
+{
+  "bot_id": "nvda_1h",
+  "account": {
+    "account_id": "309766364377470110"
+  },
+  "market": {
+    "epic": "NVDA",
+    "resolution": "HOUR",
+    "warmup_bars": 100
+  },
+  "strategy": {
+    "module": "capbot.strategies.nvda_1h:NVDA_1H",
+    "params": {
+      "earnings_blackout_dates": []
+    }
+  },
+  "risk": {
+    "bot_equity": 25000,
+    "risk_pct": 1.0,
+    "value_per_point_per_size": 1.0
+  },
+  "schedule": {
+    "timezone": "America/New_York",
+    "rth_enabled": true,
+    "rth_start": "09:30",
+    "rth_end": "16:00",
+    "disable_thursday_utc": false,
+    "no_trade_hours_berlin": []
+  },
+  "trailing": {
+    "enabled": false
+  },
+  "circuit_breaker": {
+    "losses": 3,
+    "cooldown_min": 60
+  },
+  "notifications": {
+    "email_enabled": true
+  },
+  "poll_seconds": 60,
+  "align_poll_to_bar": true,
+  "watchdog_timeout_sec": 7200,
+  "engine_overrides": {
+    "entry_mode": "SIGNAL_CLOSE",
+    "exit_priority": "TP_FIRST",
+    "trailing_mode": "none",
+    "rth_exit": false,
+    "fill_timeout_sec": 45
+  }
+}
