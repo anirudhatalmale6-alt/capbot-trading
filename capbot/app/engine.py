@@ -329,7 +329,7 @@ def _ok(x):
 
 
 def _compute_vis_checks(df, strat_params, rth, rth_enabled, tz_name, now,
-                        disable_thursday_utc, no_trade_hours, st):
+                        disable_thursday_utc, no_trade_hours, st, strat=None):
     """
     Compute visual CHECK line from enriched df. Strategy-agnostic.
     Shows: time | gates (check/X) | key indicators | LONG/SHORT | ENTRY
@@ -346,6 +346,7 @@ def _compute_vis_checks(df, strat_params, rth, rth_enabled, tz_name, now,
         t_closed = "?"
 
     close = float(row.get("close", float("nan")))
+    open_ = float(row.get("open", float("nan")))
     rsi = float(row.get("rsi14", float("nan")))
 
     # Gates
@@ -359,6 +360,7 @@ def _compute_vis_checks(df, strat_params, rth, rth_enabled, tz_name, now,
     cooldown_until = _as_ts((st or {}).get("cooldown_until_iso"))
     cooldown_block = bool(cooldown_until and now < cooldown_until)
 
+    gates_ok = (not thu_block) and rth_ok and (not nth_block) and (not cooldown_block)
     gates = f"rth={_ok(rth_ok)} day={_ok(not thu_block)} cd={_ok(not cooldown_block)}"
 
     # Strategy-specific indicators (show what's available)
@@ -405,7 +407,26 @@ def _compute_vis_checks(df, strat_params, rth, rth_enabled, tz_name, now,
 
     ind_str = " ".join(indicators)
 
-    return f"CHECK {t_closed} | {gates} | {ind_str}"
+    # LONG/SHORT/ENTRY - use the actual strategy signal check
+    long_ok = False
+    short_ok = False
+    if strat is not None and gates_ok:
+        try:
+            sig = strat.signal_on_bar_close(df, strat_params or {})
+            if sig is not None:
+                if sig.direction == "BUY":
+                    long_ok = True
+                else:
+                    short_ok = True
+        except Exception:
+            pass
+
+    entry_ok = long_ok or short_ok
+
+    return (
+        f"CHECK {t_closed} | {gates} | {ind_str} | "
+        f"LONG={_ok(long_ok)} SHORT={_ok(short_ok)} | ENTRY {_ok(entry_ok)}"
+    )
 
 
 def _handle_position_exit(client, st, pos, deal_id, direction, reason, exit_price,
@@ -1083,7 +1104,7 @@ def run_bot(cfg: Dict[str, Any], once: bool = False):
         try:
             vis_line = _compute_vis_checks(
                 df, strat_params, rth, rth_enabled, tz_name, now,
-                disable_thursday_utc, no_trade_hours, st,
+                disable_thursday_utc, no_trade_hours, st, strat=strat,
             )
             log_line(logfile, vis_line)
         except Exception as e:
