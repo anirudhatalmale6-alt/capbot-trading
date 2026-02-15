@@ -1,0 +1,124 @@
+#!/usr/bin/env python3
+"""
+Force a test transaction: BUY, wait, then SELL (close).
+
+Usage:
+  python test_trade.py --config configs/de40_5m_vwap.json
+  python test_trade.py --config configs/meta_1h.json --wait 300
+  python test_trade.py --config configs/sp500_5m.json --size 1 --wait 60
+
+Options:
+  --config   Config file (required - uses epic + account from it)
+  --wait     Seconds to hold position (default: 300 = 5 min)
+  --size     Trade size (default: 1)
+  --direction  BUY or SELL (default: BUY)
+"""
+import argparse
+import json
+import os
+import sys
+import time
+
+from capbot.broker.capital_client import CapitalClient
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Force a test trade: open, wait, close")
+    parser.add_argument("--config", required=True, help="Config JSON file")
+    parser.add_argument("--wait", type=int, default=300, help="Seconds to hold (default 300 = 5 min)")
+    parser.add_argument("--size", type=float, default=1.0, help="Trade size (default 1)")
+    parser.add_argument("--direction", default="BUY", choices=["BUY", "SELL"], help="Direction (default BUY)")
+    args = parser.parse_args()
+
+    with open(args.config) as f:
+        cfg = json.load(f)
+
+    epic = cfg["market"]["epic"]
+    account_id = cfg.get("account", {}).get("account_id")
+    bot_id = cfg.get("bot_id", "test")
+
+    print(f"Bot: {bot_id} | Epic: {epic} | Account: {account_id}")
+    print(f"Direction: {args.direction} | Size: {args.size} | Wait: {args.wait}s")
+    print()
+
+    # Login
+    print("Logging in to Capital.com...")
+    client = CapitalClient()
+    client.login()
+    client.ensure_account(account_id)
+    print("Login OK")
+
+    # Check no existing position
+    positions = client.get_positions()
+    pos_list = (positions or {}).get("positions", [])
+    for p in pos_list:
+        mkt = p.get("market", {})
+        if mkt.get("epic") == epic:
+            deal_id = p.get("position", {}).get("dealId")
+            print(f"WARNING: Already have open position on {epic} (deal_id={deal_id})")
+            print("Close it first or use a different epic.")
+            sys.exit(1)
+
+    # Open position
+    print(f"\nOpening {args.direction} {args.size} on {epic}...")
+    resp = client.open_market(epic, args.direction, args.size)
+    deal_ref = resp.get("dealReference")
+    print(f"Order response: dealReference={deal_ref}")
+
+    # Confirm
+    deal_id = None
+    for attempt in range(10):
+        time.sleep(1)
+        conf = client.confirm(deal_ref, timeout_sec=10)
+        if conf and conf.get("dealId"):
+            deal_id = conf["dealId"]
+            status = conf.get("dealStatus", "?")
+            level = conf.get("level", "?")
+            print(f"Confirmed: deal_id={deal_id} status={status} entry={level}")
+            break
+
+    if not deal_id:
+        # Fallback: check positions
+        positions = client.get_positions()
+        for p in (positions or {}).get("positions", []):
+            mkt = p.get("market", {})
+            if mkt.get("epic") == epic:
+                deal_id = p.get("position", {}).get("dealId")
+                level = p.get("position", {}).get("level")
+                print(f"Found via positions: deal_id={deal_id} entry={level}")
+                break
+
+    if not deal_id:
+        print("ERROR: Could not confirm position. Check Capital.com manually.")
+        sys.exit(1)
+
+    # Wait
+    print(f"\nPosition open. Waiting {args.wait} seconds...")
+    for remaining in range(args.wait, 0, -10):
+        print(f"  {remaining}s remaining...")
+        time.sleep(min(10, remaining))
+
+    # Close position
+    print(f"\nClosing position {deal_id}...")
+    close_resp = client.close_position(deal_id)
+    print(f"Close response: {close_resp}")
+
+    # Verify closed
+    time.sleep(2)
+    positions = client.get_positions()
+    still_open = False
+    for p in (positions or {}).get("positions", []):
+        mkt = p.get("market", {})
+        if mkt.get("epic") == epic:
+            still_open = True
+
+    if still_open:
+        print("WARNING: Position may still be open. Check Capital.com.")
+    else:
+        print("Position closed successfully!")
+
+    print("\nTest trade complete.")
+
+
+if __name__ == "__main__":
+    main()
