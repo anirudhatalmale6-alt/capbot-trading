@@ -65,31 +65,35 @@ def main():
     deal_ref = resp.get("dealReference")
     print(f"Order response: dealReference={deal_ref}")
 
-    # Confirm
-    deal_id = None
+    # Wait for confirm
     for attempt in range(10):
         time.sleep(1)
         conf = client.confirm(deal_ref, timeout_sec=10)
         if conf and conf.get("dealId"):
-            deal_id = conf["dealId"]
             status = conf.get("dealStatus", "?")
             level = conf.get("level", "?")
-            print(f"Confirmed: deal_id={deal_id} status={status} entry={level}")
+            print(f"Confirmed: status={status} entry={level}")
             break
+    else:
+        print("WARNING: Could not get confirm response, checking positions...")
 
-    if not deal_id:
-        # Fallback: check positions
+    # Get the REAL deal_id from positions (confirm dealId differs from position dealId)
+    deal_id = None
+    for attempt in range(5):
+        time.sleep(1)
         positions = client.get_positions()
         for p in (positions or {}).get("positions", []):
             mkt = p.get("market", {})
             if mkt.get("epic") == epic:
                 deal_id = p.get("position", {}).get("dealId")
                 level = p.get("position", {}).get("level")
-                print(f"Found via positions: deal_id={deal_id} entry={level}")
+                print(f"Position found: deal_id={deal_id} entry={level}")
                 break
+        if deal_id:
+            break
 
     if not deal_id:
-        print("ERROR: Could not confirm position. Check Capital.com manually.")
+        print("ERROR: Could not find position. Check Capital.com manually.")
         sys.exit(1)
 
     # Wait
@@ -98,7 +102,7 @@ def main():
         print(f"  {remaining}s remaining...")
         time.sleep(min(10, remaining))
 
-    # Close position
+    # Close position using the real deal_id from positions
     print(f"\nClosing position {deal_id}...")
     close_resp = client.close_position(deal_id)
     print(f"Close response: {close_resp}")
