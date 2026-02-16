@@ -21,6 +21,16 @@ import time
 
 from capbot.broker.capital_client import CapitalClient
 
+try:
+    from capbot.app.notifier import email_event
+except ImportError:
+    def email_event(*args, **kwargs): pass
+
+try:
+    from capbot.app.telegram_notifier import telegram_event
+except ImportError:
+    def telegram_event(*args, **kwargs): pass
+
 
 def main():
     parser = argparse.ArgumentParser(description="Force a test trade: open, wait, close")
@@ -96,6 +106,15 @@ def main():
         print("ERROR: Could not find position. Check Capital.com manually.")
         sys.exit(1)
 
+    # Notify: test trade opened
+    notify_payload = {
+        "epic": epic, "direction": args.direction, "size": args.size,
+        "deal_id": deal_id, "entry_price": level, "account_id": account_id,
+    }
+    email_event(True, bot_id, "TRADE_OPEN", notify_payload)
+    telegram_event(bot_id, "TRADE_OPEN", notify_payload)
+    print("Notifications sent (TRADE_OPEN)")
+
     # Wait
     print(f"\nPosition open. Waiting {args.wait} seconds...")
     for remaining in range(args.wait, 0, -10):
@@ -120,6 +139,15 @@ def main():
         print("WARNING: Position may still be open. Check Capital.com.")
     else:
         print("Position closed successfully!")
+        close_payload = {
+            "deal_id": deal_id, "direction": args.direction,
+            "epic": epic, "exit_price": "market",
+            "entry_price": level, "size": args.size,
+            "profit_points": 0, "profit_cash": 0,
+        }
+        email_event(True, bot_id, "EXIT_TP", close_payload)
+        telegram_event(bot_id, "EXIT_TP", close_payload)
+        print("Notifications sent (EXIT)")
 
     print("\nTest trade complete.")
 
