@@ -832,13 +832,16 @@ def run_bot(cfg: Dict[str, Any], once: bool = False):
                     sent_date = st.get("heartbeat_sent_date")
                     today = now_local.date().isoformat()
                     if sent_date != today:
-                        email_event(email_enabled, bot_id, "HEARTBEAT_RTH_OPEN", {
+                        hb_payload = {
                             "time_local": now_local.isoformat(),
                             "timezone": tz_name,
                             "account_id": account_id,
                             "epic": epic,
+                            "resolution": resolution,
                             "poll_seconds": poll,
-                        }, logfile)
+                        }
+                        email_event(email_enabled, bot_id, "HEARTBEAT_RTH_OPEN", hb_payload, logfile)
+                        telegram_event(bot_id, "HEARTBEAT_RTH_OPEN", hb_payload)
                         st["heartbeat_sent_date"] = today
                         save_state(st)
         except Exception as e:
@@ -1025,6 +1028,7 @@ def run_bot(cfg: Dict[str, Any], once: bool = False):
                         st["pos"] = pos
                         save_state(st)
                         email_event(email_enabled, bot_id, "TRAIL_SL", {"deal_id": deal_id, "sl_local": new_sl, "be_armed": be_armed}, logfile)
+                        telegram_event(bot_id, "TRAIL_SL", {"deal_id": deal_id, "sl_local": new_sl, "be_armed": be_armed})
                 except Exception as e:
                     log_line(logfile, f"TRAIL warning (sp500): {repr(e)}")
             elif trailing_mode == "option_a" and trailing_on:
@@ -1057,6 +1061,7 @@ def run_bot(cfg: Dict[str, Any], once: bool = False):
                             telegram_event(bot_id, "TRAIL_2R", {"deal_id": deal_id, "sl_local": new_sl})
 
                         email_event(email_enabled, bot_id, "TRAIL_SL", {"deal_id": deal_id, "sl_local": new_sl}, logfile)
+                        telegram_event(bot_id, "TRAIL_SL", {"deal_id": deal_id, "sl_local": new_sl})
                 except Exception as e:
                     log_line(logfile, f"TRAIL warning: {repr(e)}")
 

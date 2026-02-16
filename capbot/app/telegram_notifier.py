@@ -77,6 +77,12 @@ def _format_event(bot_id: str, event: str, payload: dict) -> str:
     elif event == "WATCHDOG_ALERT":
         lines.append(f"\u26a0\ufe0f Loop stalled for {payload.get('elapsed_sec',0)}s!")
 
+    elif event == "HEARTBEAT_RTH_OPEN":
+        lines.append(f"\U0001f49a Market open — bot healthy")
+        lines.append(f"Epic: {payload.get('epic', '?')} | TF: {payload.get('resolution', '?')}")
+        lines.append(f"Time: {payload.get('time_local', '?')}")
+        lines.append(f"Account: {payload.get('account_id', '?')}")
+
     elif event == "FILL_TIMEOUT":
         lines.append(f"\u26a0\ufe0f Order fill timeout ({payload.get('elapsed_sec',0)}s)")
         lines.append(f"Action: {payload.get('action','?')} deal={payload.get('deal_id','?')}")

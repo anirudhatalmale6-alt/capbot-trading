@@ -21,6 +21,8 @@ ICON = {
     "DAILY_SUMMARY": "📊",
     "WATCHDOG_ALERT": "⚠️",
     "FILL_TIMEOUT": "⚠️",
+    "HEARTBEAT_RTH_OPEN": "💚",
+    "STARTUP": "🚀",
     "ERROR": "⚠️",
 }
 
@@ -41,6 +43,8 @@ EVENT_LABEL = {
     "DAILY_SUMMARY": "DAILY SUMMARY",
     "WATCHDOG_ALERT": "WATCHDOG",
     "FILL_TIMEOUT": "FILL TIMEOUT",
+    "HEARTBEAT_RTH_OPEN": "MARKET OPEN",
+    "STARTUP": "STARTUP",
     "ERROR": "ERROR",
 }
 
