@@ -162,20 +162,30 @@ def main():
     if still_open:
         print("WARNING: Position may still be open. Check Capital.com.")
     else:
-        # Get actual close details from confirm
+        # Get actual close details from confirm (use broker's real profit)
         close_deal_ref = (close_resp or {}).get("dealReference")
         exit_price = entry_price
+        broker_profit = None
         if close_deal_ref:
             time.sleep(1)
             close_conf = client.confirm(str(close_deal_ref), timeout_sec=10)
-            if close_conf and close_conf.get("level"):
-                exit_price = float(close_conf["level"])
+            if close_conf:
+                if close_conf.get("level"):
+                    exit_price = float(close_conf["level"])
+                if close_conf.get("profit") is not None:
+                    broker_profit = float(close_conf["profit"])
+                    print(f"Broker confirm: level={close_conf.get('level')} profit={broker_profit}")
 
         if args.direction == "BUY":
             profit_pts = round(exit_price - entry_price, 2)
         else:
             profit_pts = round(entry_price - exit_price, 2)
-        profit_cash = round(profit_pts * args.size, 2)
+
+        # Use broker's actual profit (includes spread) if available
+        if broker_profit is not None:
+            profit_cash = round(broker_profit, 2)
+        else:
+            profit_cash = round(profit_pts * args.size, 2)
 
         print(f"Position closed! Entry={entry_price} Exit={exit_price} PnL={profit_pts}pts {currency_symbol}{profit_cash}")
         close_payload = {
