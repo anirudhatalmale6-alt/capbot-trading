@@ -107,9 +107,11 @@ def main():
         sys.exit(1)
 
     # Notify: test trade opened
+    entry_price = float(level) if level else 0
     notify_payload = {
         "epic": epic, "direction": args.direction, "size": args.size,
-        "deal_id": deal_id, "entry_price": level, "account_id": account_id,
+        "deal_id": deal_id, "entry_price": entry_price, "account_id": account_id,
+        "sl": "N/A (test)", "tp": "N/A (test)",
     }
     email_event(True, bot_id, "TRADE_OPEN", notify_payload)
     telegram_event(bot_id, "TRADE_OPEN", notify_payload)
@@ -138,12 +140,27 @@ def main():
     if still_open:
         print("WARNING: Position may still be open. Check Capital.com.")
     else:
-        print("Position closed successfully!")
+        # Get actual close details from confirm
+        close_deal_ref = (close_resp or {}).get("dealReference")
+        exit_price = entry_price
+        if close_deal_ref:
+            time.sleep(1)
+            close_conf = client.confirm(str(close_deal_ref), timeout_sec=10)
+            if close_conf and close_conf.get("level"):
+                exit_price = float(close_conf["level"])
+
+        if args.direction == "BUY":
+            profit_pts = round(exit_price - entry_price, 2)
+        else:
+            profit_pts = round(entry_price - exit_price, 2)
+        profit_cash = round(profit_pts * args.size, 2)
+
+        print(f"Position closed! Entry={entry_price} Exit={exit_price} PnL={profit_pts}pts ${profit_cash}")
         close_payload = {
             "deal_id": deal_id, "direction": args.direction,
-            "epic": epic, "exit_price": "market",
-            "entry_price": level, "size": args.size,
-            "profit_points": 0, "profit_cash": 0,
+            "epic": epic, "exit_price": exit_price,
+            "entry_price": entry_price, "size": args.size,
+            "profit_points": profit_pts, "profit_cash": profit_cash,
         }
         email_event(True, bot_id, "EXIT_TP", close_payload)
         telegram_event(bot_id, "EXIT_TP", close_payload)

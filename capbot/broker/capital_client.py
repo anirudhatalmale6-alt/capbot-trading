@@ -290,6 +290,18 @@ class CapitalClient:
         payload = {"epic": epic, "direction": direction, "size": float(size), "orderType": "MARKET"}
         return self.request("POST", "/api/v1/positions", data=json.dumps(payload)).json()
 
+    def update_position(self, deal_id: str, stop_level: float = None, profit_level: float = None) -> Dict[str, Any]:
+        """Update SL/TP on an existing position. Capital.com PUT /api/v1/positions/{dealId}."""
+        payload = {}
+        if stop_level is not None:
+            payload["stopLevel"] = float(stop_level)
+        if profit_level is not None:
+            payload["profitLevel"] = float(profit_level)
+        if not payload:
+            return {}
+        r = self.request("PUT", f"/api/v1/positions/{deal_id}", data=json.dumps(payload))
+        return r.json() if r.text else {}
+
     def close_position(self, deal_id: str) -> Dict[str, Any]:
         r = self.request("DELETE", f"/api/v1/positions/{deal_id}")
         return r.json() if r.text else {}

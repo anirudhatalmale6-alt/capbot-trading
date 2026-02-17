@@ -473,17 +473,17 @@ def _handle_position_exit(client, st, pos, deal_id, direction, reason, exit_pric
     log_line(logfile, f"EXIT {reason} deal_id={deal_id} exit_price={exit_price:.2f} profit={profit_pts:.2f}pts ${profit_cash:.2f}")
 
     email_event(email_enabled, bot_id, reason, {
-        "deal_id": deal_id, "exit_price": exit_price,
-        "direction": direction, "entry_price": entry_price,
+        "epic": epic, "deal_id": deal_id, "exit_price": round(exit_price, 2),
+        "direction": direction, "entry_price": round(entry_price, 2),
         "size": size_pos, "vpp": vpp,
-        "profit_points": profit_pts, "profit_cash": profit_cash,
+        "profit_points": round(profit_pts, 2), "profit_cash": round(profit_cash, 2),
     }, logfile)
 
     telegram_event(bot_id, reason, {
-        "deal_id": deal_id, "exit_price": exit_price,
-        "direction": direction, "entry_price": entry_price,
-        "size": size_pos, "profit_points": profit_pts,
-        "profit_cash": profit_cash,
+        "epic": epic, "deal_id": deal_id, "exit_price": round(exit_price, 2),
+        "direction": direction, "entry_price": round(entry_price, 2),
+        "size": size_pos, "profit_points": round(profit_pts, 2),
+        "profit_cash": round(profit_cash, 2),
     })
 
     return conf
@@ -979,9 +979,8 @@ def run_bot(cfg: Dict[str, Any], once: bool = False):
                 save_state(st)
                 if once:
                     return
-                if not is_sp500_spec:
-                    time.sleep(poll)
-                    continue
+                time.sleep(0 if is_sp500_spec else poll)
+                continue
 
             # ── TIME_EXIT (generic: uses exit_bars from position state) ──
             pos_exit_bars = int(pos.get("exit_bars", 0))
@@ -1001,6 +1000,10 @@ def run_bot(cfg: Dict[str, Any], once: bool = False):
                                 email_enabled, logfile, now, mode_sp500=is_sp500_spec,
                             )
                             save_state(st)
+                            if once:
+                                return
+                            time.sleep(0 if is_sp500_spec else poll)
+                            continue
                 except Exception as e:
                     log_line(logfile, f"TIME_EXIT warning: {repr(e)}")
 
@@ -1027,8 +1030,8 @@ def run_bot(cfg: Dict[str, Any], once: bool = False):
                         pos["min_fav"] = float(min_fav)
                         st["pos"] = pos
                         save_state(st)
-                        email_event(email_enabled, bot_id, "TRAIL_SL", {"deal_id": deal_id, "sl_local": new_sl, "be_armed": be_armed}, logfile)
-                        telegram_event(bot_id, "TRAIL_SL", {"deal_id": deal_id, "sl_local": new_sl, "be_armed": be_armed})
+                        email_event(email_enabled, bot_id, "TRAIL_SL", {"epic": epic, "deal_id": deal_id, "sl_local": round(new_sl, 2), "be_armed": be_armed}, logfile)
+                        telegram_event(bot_id, "TRAIL_SL", {"epic": epic, "deal_id": deal_id, "sl_local": round(new_sl, 2), "be_armed": be_armed})
                 except Exception as e:
                     log_line(logfile, f"TRAIL warning (sp500): {repr(e)}")
             elif trailing_mode == "option_a" and trailing_on:
@@ -1054,14 +1057,14 @@ def run_bot(cfg: Dict[str, Any], once: bool = False):
                         save_state(st)
 
                         if (not prev_1r) and flags.get("trail_1r_done"):
-                            email_event(email_enabled, bot_id, "TRAIL_1R", {"deal_id": deal_id, "sl_local": new_sl}, logfile)
-                            telegram_event(bot_id, "TRAIL_1R", {"deal_id": deal_id, "sl_local": new_sl})
+                            email_event(email_enabled, bot_id, "TRAIL_1R", {"epic": epic, "deal_id": deal_id, "sl_local": round(new_sl, 2)}, logfile)
+                            telegram_event(bot_id, "TRAIL_1R", {"epic": epic, "deal_id": deal_id, "sl_local": round(new_sl, 2)})
                         if (not prev_2r) and flags.get("trail_2r_done"):
-                            email_event(email_enabled, bot_id, "TRAIL_2R", {"deal_id": deal_id, "sl_local": new_sl}, logfile)
-                            telegram_event(bot_id, "TRAIL_2R", {"deal_id": deal_id, "sl_local": new_sl})
+                            email_event(email_enabled, bot_id, "TRAIL_2R", {"epic": epic, "deal_id": deal_id, "sl_local": round(new_sl, 2)}, logfile)
+                            telegram_event(bot_id, "TRAIL_2R", {"epic": epic, "deal_id": deal_id, "sl_local": round(new_sl, 2)})
 
-                        email_event(email_enabled, bot_id, "TRAIL_SL", {"deal_id": deal_id, "sl_local": new_sl}, logfile)
-                        telegram_event(bot_id, "TRAIL_SL", {"deal_id": deal_id, "sl_local": new_sl})
+                        email_event(email_enabled, bot_id, "TRAIL_SL", {"epic": epic, "deal_id": deal_id, "sl_local": round(new_sl, 2)}, logfile)
+                        telegram_event(bot_id, "TRAIL_SL", {"epic": epic, "deal_id": deal_id, "sl_local": round(new_sl, 2)})
                 except Exception as e:
                     log_line(logfile, f"TRAIL warning: {repr(e)}")
 
@@ -1328,16 +1331,22 @@ def run_bot(cfg: Dict[str, Any], once: bool = False):
 
         log_line(logfile, f"ENTRY \u2705 deal_id={deal_id} {sig.direction} size={size} entry={entry_price:.2f} SL={sl_local:.2f} TP={tp_local:.2f}")
 
+        # Sync SL/TP to broker (so Capital.com also protects the position)
+        try:
+            client.update_position(str(deal_id), stop_level=round(sl_local, 2), profit_level=round(tp_local, 2))
+            log_line(logfile, f"BROKER_SL_TP_SYNC OK deal_id={deal_id} SL={sl_local:.2f} TP={tp_local:.2f}")
+        except Exception as e:
+            log_line(logfile, f"BROKER_SL_TP_SYNC warning: {repr(e)}")
+
         email_event(email_enabled, bot_id, "TRADE_OPEN", {
-            "epic": epic, "direction": sig.direction, "size": size,
-            "entry_price": entry_price, "sl": sl_local, "tp": tp_local,
+            "epic": epic, "resolution": resolution, "direction": sig.direction, "size": size,
+            "entry_price": round(entry_price, 2), "sl": round(sl_local, 2), "tp": round(tp_local, 2),
             "deal_id": deal_id, "account_id": account_id,
-            "open_resp": resp, "confirm": conf,
         }, logfile)
 
         telegram_event(bot_id, "TRADE_OPEN", {
-            "epic": epic, "direction": sig.direction, "size": size,
-            "entry_price": entry_price, "sl": sl_local, "tp": tp_local,
+            "epic": epic, "resolution": resolution, "direction": sig.direction, "size": size,
+            "entry_price": round(entry_price, 2), "sl": round(sl_local, 2), "tp": round(tp_local, 2),
             "deal_id": deal_id,
         })
 

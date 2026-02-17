@@ -93,9 +93,15 @@ def _market_and_tf(payload: Dict[str, Any], meta: Dict[str, Any]) -> Tuple[str, 
     market = str(raw_market).replace("_", " ").strip()
 
     # Normalize epic -> display name
+    _EPIC_NAMES = {
+        "DE40": "Germany 40", "GER40": "Germany 40", "GERMANY40": "Germany 40",
+        "GERMANY40CASH": "Germany 40",
+        "US500": "S&P 500", "SPX500": "S&P 500",
+        "META": "META", "NVDA": "NVDA",
+    }
     upper = market.upper().replace(" ", "")
-    if upper in ("DE40", "GER40", "GERMANY40", "GERMANY40CASH"):
-        market = "Germany 40"
+    if upper in _EPIC_NAMES:
+        market = _EPIC_NAMES[upper]
 
     # Timeframe/resolution
     tf = (
@@ -104,17 +110,25 @@ def _market_and_tf(payload: Dict[str, Any], meta: Dict[str, Any]) -> Tuple[str, 
         or payload.get("resolution")
         or meta.get("timeframe")
         or (market_dict.get("resolution") if isinstance(market_dict, dict) else None)
-        or "5m"
+        or ""
     )
 
     tf = str(tf).strip()
 
-    # Normalize MINUTE_5 / MINUTE 5 / etc -> 5m
+    # Normalize resolution names -> display format
     tfx = tf.upper().replace(" ", "_")
     if tfx.startswith("MINUTE_"):
         try:
             n = int(tfx.split("_")[-1])
             tf = f"{n}m"
+        except Exception:
+            pass
+    elif tfx == "HOUR":
+        tf = "1h"
+    elif tfx.startswith("HOUR_"):
+        try:
+            n = int(tfx.split("_")[-1])
+            tf = f"{n}h"
         except Exception:
             pass
 
@@ -189,15 +203,15 @@ def render_email(event: str, bot_id: str, payload: Dict[str, Any], meta: Dict[st
     # trade bits
     add("Direction", direction)
     add("Size", payload.get("size"))
-    add("Entry", entry_px)
-    add("SL", payload.get("sl_local") or payload.get("sl"))
-    add("TP", payload.get("tp_local") or payload.get("tp"))
-    add("Exit", exit_px)
+    add("Entry", _fmt(entry_px))
+    add("SL", _fmt(payload.get("sl_local") or payload.get("sl")))
+    add("TP", _fmt(payload.get("tp_local") or payload.get("tp")))
+    add("Exit", _fmt(exit_px))
 
     if pnl_cash is not None:
-        add("PnL (cash)", pnl_cash)
+        add("PnL (cash)", _fmt(pnl_cash))
     if pnl_pts is not None:
-        add("PnL (pts)", pnl_pts)
+        add("PnL (pts)", _fmt(pnl_pts))
 
     # health bits
     add("State", payload.get("state"))
