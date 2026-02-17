@@ -59,14 +59,23 @@ def main():
     print("Login OK")
 
     # Get account currency
-    _CURRENCY_SYMBOLS = {"USD": "$", "EUR": "€", "GBP": "£", "CHF": "CHF ", "JPY": "¥", "AUD": "A$", "CAD": "C$"}
+    _CURRENCY_SYMBOLS = {
+        "USD": "$", "USDD": "$",
+        "EUR": "€", "EURD": "€",
+        "GBP": "£", "GBPD": "£",
+        "CHF": "CHF ", "CHFD": "CHF ",
+        "JPY": "¥", "JPYD": "¥",
+        "AUD": "A$", "AUDD": "A$",
+        "CAD": "C$", "CADD": "C$",
+    }
     account_currency = "USD"
     currency_symbol = "$"
     try:
         sess_info = client.get_session()
-        account_currency = (sess_info.get("currency") or "USD").upper()
-        currency_symbol = _CURRENCY_SYMBOLS.get(account_currency, account_currency + " ")
-        print(f"Account currency: {account_currency} ({currency_symbol.strip()})")
+        raw_ccy = (sess_info.get("currency") or "USD").upper()
+        account_currency = raw_ccy.rstrip("D") if len(raw_ccy) == 4 and raw_ccy.endswith("D") else raw_ccy
+        currency_symbol = _CURRENCY_SYMBOLS.get(raw_ccy, _CURRENCY_SYMBOLS.get(account_currency, account_currency + " "))
+        print(f"Account currency: {raw_ccy} -> {account_currency} ({currency_symbol.strip()})")
     except Exception:
         print("Could not detect account currency, defaulting to USD")
 

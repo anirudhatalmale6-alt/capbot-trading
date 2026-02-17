@@ -1,16 +1,20 @@
 [Unit]
-Description=capbot trading bot (%i)
+Description=CapBot %i
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-User=%u
-WorkingDirectory=/home/%u/capbot
-ExecStart=/home/%u/capbot/venv/bin/python run_bot.py run --config configs/%i.json
-Restart=on-failure
-RestartSec=30
-Environment=CAPBOT_BASEDIR=/home/%u/capbot_data
+User=ubuntu
+WorkingDirectory=/opt/capbot/multibot
+EnvironmentFile=/opt/_keep_secrets/secrets/capital.env
+Environment=CAPBOT_BASEDIR=/home/ubuntu/capbot_data
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/capbot/multibot/.venv/bin/python run_bot.py run --config configs/%i.json
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
 
 [Install]
 WantedBy=multi-user.target
