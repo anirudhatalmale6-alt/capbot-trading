@@ -266,26 +266,43 @@ def safe_close_position(client, deal_id):
         return None
 
 
-def safe_append_row(csv_path, ts, bot_id, epic, direction, size, reason, exit_price, conf):
-    """Never crash the bot for trade logging."""
+def safe_append_row(csv_path, ts, bot_id, epic, direction, size, reason, exit_price, conf,
+                    entry_price=None, entry_time=None, r_points=None, sl_local=None, tp_local=None,
+                    deal_id=None, profit_pts=None, profit_cash=None):
+    """Never crash the bot for trade logging. Maps to trade_log.py HEADER."""
     try:
-        sig = inspect.signature(append_row)
-        n = len(sig.parameters)
-        if n == 2:
-            row = {
-                "ts": ts, "bot_id": bot_id, "epic": epic,
-                "direction": direction, "size": size,
-                "reason": reason, "exit_price": exit_price, "conf": conf,
-            }
-            return append_row(csv_path, row)
-        return append_row(csv_path, ts, bot_id, epic, direction, size, reason, exit_price, conf)
+        close_ref = ""
+        if isinstance(conf, dict):
+            close_ref = conf.get("dealReference") or conf.get("deal_reference") or ""
+
+        row = {
+            "entry_time": entry_time or "",
+            "exit_time": ts,
+            "direction": direction,
+            "size": size,
+            "entry_price_est": entry_price or "",
+            "entry_price_api": entry_price or "",
+            "exit_price_est": exit_price,
+            "exit_price_api": exit_price,
+            "profit_api": profit_pts or "",
+            "profit_ccy": profit_cash or "",
+            "r_points": r_points or "",
+            "initial_sl": sl_local or "",
+            "sl_local": sl_local or "",
+            "tp_local": tp_local or "",
+            "exit_reason": reason,
+            "position_deal_id": deal_id or "",
+            "close_dealReference": close_ref,
+            "meta_json": json.dumps({"bot_id": bot_id, "epic": epic}, default=str),
+        }
+        return append_row(csv_path, row)
     except Exception:
         try:
-            return append_row(csv_path, json.dumps({
-                "ts": ts, "bot_id": bot_id, "epic": epic,
-                "direction": direction, "size": size,
-                "reason": reason, "exit_price": exit_price, "conf": conf,
-            }, default=str))
+            return append_row(csv_path, {
+                "exit_time": ts, "direction": direction, "size": size,
+                "exit_price_est": exit_price, "exit_reason": reason,
+                "meta_json": json.dumps({"bot_id": bot_id, "epic": epic, "error": "fallback"}, default=str),
+            })
         except Exception:
             return None
 
@@ -435,6 +452,23 @@ def _handle_position_exit(client, st, pos, deal_id, direction, reason, exit_pric
     """Common exit handler: close, log, circuit breaker, state cleanup, notify."""
     conf = safe_close_position(client, str(deal_id))
 
+    # Try to get broker's actual exit price and profit from confirm
+    broker_profit = None
+    broker_exit_price = None
+    try:
+        close_ref = (conf or {}).get("dealReference") or (conf or {}).get("deal_reference")
+        if close_ref:
+            time.sleep(0.5)
+            close_conf = client.confirm(str(close_ref), timeout_sec=10)
+            if close_conf:
+                if close_conf.get("profit") is not None:
+                    broker_profit = float(close_conf["profit"])
+                if close_conf.get("level") is not None:
+                    broker_exit_price = float(close_conf["level"])
+                log_line(logfile, f"BROKER_CLOSE_CONFIRM: profit={broker_profit} level={broker_exit_price}")
+    except Exception as e:
+        log_line(logfile, f"BROKER_CLOSE_CONFIRM warning: {repr(e)}")
+
     try:
         st["last_broker_close"] = {"close_resp": conf}
         st["last_broker_snap"] = {"positions_payload": client.get_positions()}
@@ -445,7 +479,9 @@ def _handle_position_exit(client, st, pos, deal_id, direction, reason, exit_pric
     except Exception as e:
         log_line(logfile, f"EXIT_SNAP warning: {repr(e)}")
 
-    safe_append_row(csv_path, now.isoformat(), bot_id, epic, direction, pos.get("size"), reason, exit_price, conf)
+    # Use broker exit price if available
+    if broker_exit_price is not None:
+        exit_price = broker_exit_price
 
     # Circuit breaker
     entry_price = 0.0
@@ -456,7 +492,11 @@ def _handle_position_exit(client, st, pos, deal_id, direction, reason, exit_pric
         entry_price = float(pos.get("entry_price_est", 0))
         size_pos = float(pos.get("size", 0))
         profit_pts = (exit_price - entry_price) if direction == "BUY" else (entry_price - exit_price)
-        profit_cash = profit_pts * size_pos * vpp
+        # Prefer broker profit if available
+        if broker_profit is not None:
+            profit_cash = broker_profit
+        else:
+            profit_cash = profit_pts * size_pos * vpp
         consec = int(st.get("consec_losses", 0))
         consec = (consec + 1) if profit_cash < 0 else 0
         st["consec_losses"] = consec
@@ -465,6 +505,11 @@ def _handle_position_exit(client, st, pos, deal_id, direction, reason, exit_pric
             log_line(logfile, f"CIRCUIT_BREAKER: {consec} consecutive losses, cooldown {cb_cooldown}min")
     except Exception as e:
         log_line(logfile, f"CIRCUIT_BREAKER calc warning: {repr(e)}")
+
+    safe_append_row(csv_path, now.isoformat(), bot_id, epic, direction, size_pos, reason, exit_price, conf,
+                    entry_price=entry_price, entry_time=pos.get("entry_bar_time_utc") or pos.get("ts_signal_utc"),
+                    r_points=pos.get("r_points"), sl_local=pos.get("sl_local"), tp_local=pos.get("tp_local"),
+                    deal_id=deal_id, profit_pts=round(profit_pts, 2), profit_cash=round(profit_cash, 2))
 
     st["pos"] = {}
     if not mode_sp500:
