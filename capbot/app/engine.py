@@ -448,7 +448,8 @@ def _compute_vis_checks(df, strat_params, rth, rth_enabled, tz_name, now,
 
 def _handle_position_exit(client, st, pos, deal_id, direction, reason, exit_price,
                           csv_path, bot_id, epic, vpp, cb_losses, cb_cooldown,
-                          email_enabled, logfile, now, mode_sp500=False):
+                          email_enabled, logfile, now, mode_sp500=False,
+                          currency_symbol="$", account_currency="USD"):
     """Common exit handler: close, log, circuit breaker, state cleanup, notify."""
     conf = safe_close_position(client, str(deal_id))
 
@@ -515,13 +516,14 @@ def _handle_position_exit(client, st, pos, deal_id, direction, reason, exit_pric
     if not mode_sp500:
         st["last_closed_time"] = now.isoformat()
 
-    log_line(logfile, f"EXIT {reason} deal_id={deal_id} exit_price={exit_price:.2f} profit={profit_pts:.2f}pts ${profit_cash:.2f}")
+    log_line(logfile, f"EXIT {reason} deal_id={deal_id} exit_price={exit_price:.2f} profit={profit_pts:.2f}pts {currency_symbol}{profit_cash:.2f}")
 
     email_event(email_enabled, bot_id, reason, {
         "epic": epic, "deal_id": deal_id, "exit_price": round(exit_price, 2),
         "direction": direction, "entry_price": round(entry_price, 2),
         "size": size_pos, "vpp": vpp,
         "profit_points": round(profit_pts, 2), "profit_cash": round(profit_cash, 2),
+        "currency": account_currency, "currency_symbol": currency_symbol,
     }, logfile)
 
     telegram_event(bot_id, reason, {
@@ -529,6 +531,7 @@ def _handle_position_exit(client, st, pos, deal_id, direction, reason, exit_pric
         "direction": direction, "entry_price": round(entry_price, 2),
         "size": size_pos, "profit_points": round(profit_pts, 2),
         "profit_cash": round(profit_cash, 2),
+        "currency": account_currency, "currency_symbol": currency_symbol,
     })
 
     return conf
@@ -808,6 +811,19 @@ def run_bot(cfg: Dict[str, Any], once: bool = False):
     _install_signal_handlers(logfile)
 
     client = CapitalClient()
+
+    # ── Account currency ──
+    _CURRENCY_SYMBOLS = {"USD": "$", "EUR": "€", "GBP": "£", "CHF": "CHF ", "JPY": "¥", "AUD": "A$", "CAD": "C$"}
+    account_currency = "USD"
+    currency_symbol = "$"
+    try:
+        sess_info = client.get_session()
+        account_currency = (sess_info.get("currency") or "USD").upper()
+        currency_symbol = _CURRENCY_SYMBOLS.get(account_currency, account_currency + " ")
+        log_line(logfile, f"ACCOUNT_CURRENCY: {account_currency} ({currency_symbol.strip()})")
+    except Exception as e:
+        log_line(logfile, f"ACCOUNT_CURRENCY warning (defaulting to USD): {repr(e)}")
+
     email_startup(email_enabled, bot_id, cfg, logfile)
     telegram_event(bot_id, "STARTUP", {"epic": epic, "resolution": resolution})
 
@@ -845,6 +861,7 @@ def run_bot(cfg: Dict[str, Any], once: bool = False):
                     client, st, pos, deal_id, direction, "EXIT_SHUTDOWN", exit_price,
                     csv_path, bot_id, epic, vpp, cb_losses, cb_cooldown,
                     email_enabled, logfile, now,
+                    currency_symbol=currency_symbol, account_currency=account_currency,
                 )
                 save_state(st)
             else:
@@ -982,6 +999,7 @@ def run_bot(cfg: Dict[str, Any], once: bool = False):
                     client, st, pos, deal_id, direction, "EXIT_RTH", close_px,
                     csv_path, bot_id, epic, vpp, cb_losses, cb_cooldown,
                     email_enabled, logfile, now,
+                    currency_symbol=currency_symbol, account_currency=account_currency,
                 )
                 save_state(st)
                 if once:
@@ -1022,6 +1040,7 @@ def run_bot(cfg: Dict[str, Any], once: bool = False):
                     client, st, pos, deal_id, direction, reason, exit_price,
                     csv_path, bot_id, epic, vpp, cb_losses, cb_cooldown,
                     email_enabled, logfile, now, mode_sp500=is_sp500_spec,
+                    currency_symbol=currency_symbol, account_currency=account_currency,
                 )
                 save_state(st)
                 if once:
@@ -1045,6 +1064,7 @@ def run_bot(cfg: Dict[str, Any], once: bool = False):
                                 client, st, pos, deal_id, direction, "TIME_EXIT", close_px,
                                 csv_path, bot_id, epic, vpp, cb_losses, cb_cooldown,
                                 email_enabled, logfile, now, mode_sp500=is_sp500_spec,
+                                currency_symbol=currency_symbol, account_currency=account_currency,
                             )
                             save_state(st)
                             if once:

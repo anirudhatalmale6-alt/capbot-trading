@@ -56,7 +56,8 @@ def _format_event(bot_id: str, event: str, payload: dict) -> str:
     elif event in ("EXIT_TP", "EXIT_SL", "EXIT_RTH", "TIME_EXIT"):
         emoji = "\U0001f4b0" if event == "EXIT_TP" else "\U0001f6d1" if event == "EXIT_SL" else "\u23f0"
         pnl = payload.get("profit_cash", 0)
-        pnl_str = f"+${pnl:.2f}" if pnl >= 0 else f"-${abs(pnl):.2f}"
+        ccy = payload.get("currency_symbol", "$")
+        pnl_str = f"+{ccy}{pnl:.2f}" if pnl >= 0 else f"-{ccy}{abs(pnl):.2f}"
         lines.append(f"{emoji} {payload.get('direction', '?')} closed @ {payload.get('exit_price', '?')}")
         lines.append(f"P&L: {pnl_str} ({payload.get('profit_points', 0):.1f} pts)")
 

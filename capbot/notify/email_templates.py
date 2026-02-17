@@ -177,8 +177,10 @@ def render_email(event: str, bot_id: str, payload: Dict[str, Any], meta: Dict[st
 
     pnl_cash = payload.get("profit_cash") or payload.get("pnl_cash")
     pnl_pts = payload.get("profit_points") or payload.get("pnl_points")
+    ccy_sym = payload.get("currency_symbol", "")
+    ccy_code = payload.get("currency", "")
     if pnl_cash is not None:
-        summary_bits.append(f"PnL {_fmt(pnl_cash)}")
+        summary_bits.append(f"PnL {ccy_sym}{_fmt(pnl_cash)}")
     elif pnl_pts is not None:
         summary_bits.append(f"PnL {_fmt(pnl_pts)} pts")
 
@@ -209,7 +211,8 @@ def render_email(event: str, bot_id: str, payload: Dict[str, Any], meta: Dict[st
     add("Exit", _fmt(exit_px))
 
     if pnl_cash is not None:
-        add("PnL (cash)", _fmt(pnl_cash))
+        pnl_label = f"PnL ({ccy_code})" if ccy_code else "PnL (cash)"
+        add(pnl_label, f"{ccy_sym}{_fmt(pnl_cash)}")
     if pnl_pts is not None:
         add("PnL (pts)", _fmt(pnl_pts))
 

@@ -58,6 +58,18 @@ def main():
     client.ensure_account(account_id)
     print("Login OK")
 
+    # Get account currency
+    _CURRENCY_SYMBOLS = {"USD": "$", "EUR": "€", "GBP": "£", "CHF": "CHF ", "JPY": "¥", "AUD": "A$", "CAD": "C$"}
+    account_currency = "USD"
+    currency_symbol = "$"
+    try:
+        sess_info = client.get_session()
+        account_currency = (sess_info.get("currency") or "USD").upper()
+        currency_symbol = _CURRENCY_SYMBOLS.get(account_currency, account_currency + " ")
+        print(f"Account currency: {account_currency} ({currency_symbol.strip()})")
+    except Exception:
+        print("Could not detect account currency, defaulting to USD")
+
     # Check no existing position
     positions = client.get_positions()
     pos_list = (positions or {}).get("positions", [])
@@ -112,6 +124,7 @@ def main():
         "epic": epic, "direction": args.direction, "size": args.size,
         "deal_id": deal_id, "entry_price": entry_price, "account_id": account_id,
         "sl": "N/A (test)", "tp": "N/A (test)",
+        "currency": account_currency, "currency_symbol": currency_symbol,
     }
     email_event(True, bot_id, "TRADE_OPEN", notify_payload)
     telegram_event(bot_id, "TRADE_OPEN", notify_payload)
@@ -155,12 +168,13 @@ def main():
             profit_pts = round(entry_price - exit_price, 2)
         profit_cash = round(profit_pts * args.size, 2)
 
-        print(f"Position closed! Entry={entry_price} Exit={exit_price} PnL={profit_pts}pts ${profit_cash}")
+        print(f"Position closed! Entry={entry_price} Exit={exit_price} PnL={profit_pts}pts {currency_symbol}{profit_cash}")
         close_payload = {
             "deal_id": deal_id, "direction": args.direction,
             "epic": epic, "exit_price": exit_price,
             "entry_price": entry_price, "size": args.size,
             "profit_points": profit_pts, "profit_cash": profit_cash,
+            "currency": account_currency, "currency_symbol": currency_symbol,
         }
         email_event(True, bot_id, "EXIT_TP", close_payload)
         telegram_event(bot_id, "EXIT_TP", close_payload)
