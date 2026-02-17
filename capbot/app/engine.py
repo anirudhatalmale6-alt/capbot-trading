@@ -560,11 +560,12 @@ def _install_signal_handlers(logfile: str):
 class _Watchdog:
     """Background thread that alerts if the main loop hasn't ticked recently."""
 
-    def __init__(self, timeout_sec: int, bot_id: str, logfile: str, email_enabled: bool):
+    def __init__(self, timeout_sec: int, bot_id: str, logfile: str, email_enabled: bool, epic: str = ""):
         self._timeout = max(60, timeout_sec)
         self._bot_id = bot_id
         self._logfile = logfile
         self._email_enabled = email_enabled
+        self._epic = epic
         self._last_tick = time.monotonic()
         self._lock = threading.Lock()
         self._stop = threading.Event()
@@ -594,9 +595,11 @@ class _Watchdog:
                 log_line(self._logfile, msg)
                 email_event(self._email_enabled, self._bot_id, "WATCHDOG_ALERT", {
                     "elapsed_sec": int(elapsed), "threshold_sec": self._timeout,
+                    "epic": self._epic,
                 }, self._logfile)
                 telegram_event(self._bot_id, "WATCHDOG_ALERT", {
                     "elapsed_sec": int(elapsed), "threshold_sec": self._timeout,
+                    "epic": self._epic,
                 })
 
 
@@ -667,7 +670,7 @@ def _send_daily_summary(csv_path, bot_id, epic, email_enabled, logfile):
 
     total = len(trades)
     if total == 0:
-        summary = {"trades": 0, "message": "No trades today"}
+        summary = {"trades": 0, "message": "No trades today", "epic": epic, "date": today}
     else:
         wins = 0
         total_pnl = 0.0
@@ -812,7 +815,7 @@ def run_bot(cfg: Dict[str, Any], once: bool = False):
 
     # ── Heartbeat watchdog ──
     watchdog_timeout = int(cfg.get("watchdog_timeout_sec", bar_minutes * 60 * 3))
-    watchdog = _Watchdog(watchdog_timeout, bot_id, logfile, email_enabled)
+    watchdog = _Watchdog(watchdog_timeout, bot_id, logfile, email_enabled, epic=epic)
     if not once:
         watchdog.start()
 
@@ -983,9 +986,8 @@ def run_bot(cfg: Dict[str, Any], once: bool = False):
                 save_state(st)
                 if once:
                     return
-                if not is_sp500_spec:
-                    time.sleep(poll)
-                    continue
+                time.sleep(0 if is_sp500_spec else poll)
+                continue
 
             # ── Check SL/TP levels exist ──
             _tp = pos.get("tp_local")
@@ -1328,11 +1330,11 @@ def run_bot(cfg: Dict[str, Any], once: bool = False):
                 log_line(logfile, f"FILL_TIMEOUT: force-closing orphan deal_id={orphan_id}")
                 safe_close_position(client, orphan_id)
                 email_event(email_enabled, bot_id, "FILL_TIMEOUT", {
-                    "action": "force_closed", "deal_id": orphan_id,
+                    "epic": epic, "action": "force_closed", "deal_id": orphan_id,
                     "elapsed_sec": int(fill_elapsed),
                 }, logfile)
                 telegram_event(bot_id, "FILL_TIMEOUT", {
-                    "action": "force_closed", "deal_id": orphan_id,
+                    "epic": epic, "action": "force_closed", "deal_id": orphan_id,
                     "elapsed_sec": int(fill_elapsed),
                 })
 
