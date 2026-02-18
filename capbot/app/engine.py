@@ -470,6 +470,30 @@ def _handle_position_exit(client, st, pos, deal_id, direction, reason, exit_pric
     except Exception as e:
         log_line(logfile, f"BROKER_CLOSE_CONFIRM warning: {repr(e)}")
 
+    # Fallback: fetch from transaction history if confirm didn't have profit
+    if broker_profit is None:
+        try:
+            time.sleep(1.5)
+            history = client.get_history_transactions(max_items=5)
+            transactions = history.get("transactions") or []
+            for tx in transactions:
+                ref = tx.get("reference") or ""
+                tx_type = (tx.get("type") or tx.get("transactionType") or "").upper()
+                if str(deal_id) in str(ref) or "TRADE" in tx_type:
+                    for field in ("profitAndLoss", "profit", "cashTransaction", "amount"):
+                        val = tx.get(field)
+                        if val is not None:
+                            try:
+                                broker_profit = float(str(val).replace(",", ""))
+                                log_line(logfile, f"BROKER_TX_HISTORY profit ({field}): {broker_profit}")
+                                break
+                            except (ValueError, TypeError):
+                                pass
+                    if broker_profit is not None:
+                        break
+        except Exception as e:
+            log_line(logfile, f"BROKER_TX_HISTORY warning: {repr(e)}")
+
     try:
         st["last_broker_close"] = {"close_resp": conf}
         st["last_broker_snap"] = {"positions_payload": client.get_positions()}

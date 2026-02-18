@@ -162,7 +162,7 @@ def main():
     if still_open:
         print("WARNING: Position may still be open. Check Capital.com.")
     else:
-        # Get actual close details from confirm (use broker's real profit)
+        # Get actual close details from confirm
         close_deal_ref = (close_resp or {}).get("dealReference")
         exit_price = entry_price
         broker_profit = None
@@ -170,22 +170,49 @@ def main():
             time.sleep(1)
             close_conf = client.confirm(str(close_deal_ref), timeout_sec=10)
             if close_conf:
+                print(f"Broker confirm response: {close_conf}")
                 if close_conf.get("level"):
                     exit_price = float(close_conf["level"])
                 if close_conf.get("profit") is not None:
                     broker_profit = float(close_conf["profit"])
-                    print(f"Broker confirm: level={close_conf.get('level')} profit={broker_profit}")
+                    print(f"Broker confirm profit: {broker_profit}")
+
+        # Fallback: fetch from transaction history if confirm didn't have profit
+        if broker_profit is None:
+            try:
+                time.sleep(2)
+                history = client.get_history_transactions(max_items=5)
+                transactions = history.get("transactions") or []
+                for tx in transactions:
+                    ref = tx.get("reference") or ""
+                    tx_type = (tx.get("type") or tx.get("transactionType") or "").upper()
+                    if str(deal_id) in str(ref) or "TRADE" in tx_type:
+                        # Check for profit/cashTransaction/profitAndLoss fields
+                        for field in ("profitAndLoss", "profit", "cashTransaction", "amount"):
+                            val = tx.get(field)
+                            if val is not None:
+                                try:
+                                    broker_profit = float(str(val).replace(",", ""))
+                                    print(f"Transaction history profit ({field}): {broker_profit}")
+                                    break
+                                except (ValueError, TypeError):
+                                    pass
+                        if broker_profit is not None:
+                            break
+            except Exception as e:
+                print(f"Transaction history lookup warning: {e}")
 
         if args.direction == "BUY":
             profit_pts = round(exit_price - entry_price, 2)
         else:
             profit_pts = round(entry_price - exit_price, 2)
 
-        # Use broker's actual profit (includes spread) if available
+        # Use broker's actual profit (includes spread + currency conversion) if available
         if broker_profit is not None:
             profit_cash = round(broker_profit, 2)
         else:
             profit_cash = round(profit_pts * args.size, 2)
+            print("WARNING: Could not get broker profit, using local calculation")
 
         print(f"Position closed! Entry={entry_price} Exit={exit_price} PnL={profit_pts}pts {currency_symbol}{profit_cash}")
         close_payload = {
