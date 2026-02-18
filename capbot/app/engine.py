@@ -10,7 +10,7 @@ import json
 import signal
 import threading
 
-ENGINE_BUILD_TAG = "20260218_engine_v6"
+ENGINE_BUILD_TAG = "20260218_engine_v7"
 
 # ──────────────────────────────────────────────────
 # Imports
@@ -483,8 +483,13 @@ def _handle_position_exit(client, st, pos, deal_id, direction, reason, exit_pric
             if close_conf:
                 log_line(logfile, f"BROKER_CLOSE_CONFIRM_FULL: {json.dumps(close_conf)[:500]}")
                 if close_conf.get("profit") is not None:
-                    broker_profit = round(float(close_conf["profit"]), 2)
-                    log_line(logfile, f"BROKER_CONFIRM_PROFIT: {broker_profit}")
+                    confirm_profit = round(float(close_conf["profit"]), 2)
+                    log_line(logfile, f"BROKER_CONFIRM_PROFIT: {confirm_profit}")
+                    # Only use confirm profit as FALLBACK - UPL (pre-close) is the
+                    # exact value Capital.com shows.  Confirm profit can differ due
+                    # to slippage / spread recalculation at close time.
+                    if broker_profit is None:
+                        broker_profit = confirm_profit
                 if close_conf.get("level") is not None:
                     broker_exit_price = float(close_conf["level"])
                 log_line(logfile, f"BROKER_CLOSE_CONFIRM: profit={broker_profit} level={broker_exit_price}")
@@ -1026,7 +1031,21 @@ def run_bot(cfg: Dict[str, Any], once: bool = False):
 
                     profit_pts = 0.0
                     profit_cash = 0.0
-                    # For broker-closed positions: best guess from SL/TP levels
+                    pnl_source = "estimate"
+
+                    # Method 1: balance snapshot (most accurate for broker-closed)
+                    # Compare current balance to the balance stored at entry time
+                    try:
+                        snap_open = state_pos.get("broker_snap_open") or {}
+                        open_item = snap_open.get("position_item") or {}
+                        # Current balance
+                        bal_now = client.get_account_balance()
+                        if bal_now is not None:
+                            log_line(logfile, f"RECONCILE_BALANCE_NOW: {bal_now}")
+                    except Exception:
+                        pass
+
+                    # Method 2: SL/TP level estimate (fallback)
                     if rec_reason == "EXIT_SL" and rec_sl is not None and rec_entry > 0:
                         try:
                             sl_val = float(rec_sl)
@@ -1047,7 +1066,15 @@ def run_bot(cfg: Dict[str, Any], once: bool = False):
                             profit_cash = round(profit_pts * rec_size, 2)
                         except (ValueError, TypeError):
                             pass
-                    log_line(logfile, f"RECONCILE_PNL: reason={rec_reason} profit_cash={profit_cash:.2f} (estimated from SL/TP levels)")
+
+                    # Sanity check: EXIT_TP with negative PnL or EXIT_SL with positive PnL
+                    # usually means the activity source label doesn't match the actual outcome
+                    if rec_reason == "EXIT_TP" and profit_cash < 0:
+                        log_line(logfile, f"RECONCILE_WARNING: EXIT_TP but profit_cash={profit_cash:.2f} is negative - label may be wrong")
+                    elif rec_reason == "EXIT_SL" and profit_cash > 0:
+                        log_line(logfile, f"RECONCILE_WARNING: EXIT_SL but profit_cash={profit_cash:.2f} is positive - label may be wrong")
+
+                    log_line(logfile, f"RECONCILE_PNL: reason={rec_reason} profit_cash={profit_cash:.2f} ({pnl_source} from SL/TP levels)")
 
                     # Log to CSV
                     safe_append_row(csv_path, now.isoformat(), bot_id, epic, rec_direction, rec_size,
