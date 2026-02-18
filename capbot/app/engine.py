@@ -10,7 +10,7 @@ import json
 import signal
 import threading
 
-ENGINE_BUILD_TAG = "20260218_engine_v7"
+ENGINE_BUILD_TAG = "20260218_engine_v8"
 
 # ──────────────────────────────────────────────────
 # Imports
@@ -941,7 +941,12 @@ def run_bot(cfg: Dict[str, Any], once: bool = False):
             now_local = now.tz_convert(tz_name)
             if now_local.weekday() < 5:
                 sh, sm = map(int, rth_start.split(":"))
-                if now_local.hour == sh and now_local.minute == sm:
+                # Use a range check: fire heartbeat if we're within the first 30 min
+                # of RTH open. This handles 1h bots whose polls only fire at :00
+                # (and would miss an exact :30 check).
+                rth_open_min = sh * 60 + sm
+                now_min = now_local.hour * 60 + now_local.minute
+                if rth_open_min <= now_min < rth_open_min + 30:
                     sent_date = st.get("heartbeat_sent_date")
                     today = now_local.date().isoformat()
                     if sent_date != today:
@@ -965,7 +970,9 @@ def run_bot(cfg: Dict[str, Any], once: bool = False):
             now_local = now.tz_convert(tz_name)
             if now_local.weekday() < 5:
                 eh, em = map(int, rth_end.split(":"))
-                if now_local.hour == eh and now_local.minute == em:
+                rth_close_min = eh * 60 + em
+                now_min_ds = now_local.hour * 60 + now_local.minute
+                if rth_close_min <= now_min_ds < rth_close_min + 30:
                     summary_date = st.get("daily_summary_sent_date")
                     today = now_local.date().isoformat()
                     if summary_date != today:
