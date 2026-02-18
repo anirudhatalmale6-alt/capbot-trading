@@ -10,7 +10,7 @@ import json
 import signal
 import threading
 
-ENGINE_BUILD_TAG = "20260218_engine_v4"
+ENGINE_BUILD_TAG = "20260218_engine_v5"
 
 # ──────────────────────────────────────────────────
 # Imports
@@ -452,7 +452,17 @@ def _handle_position_exit(client, st, pos, deal_id, direction, reason, exit_pric
                           currency_symbol="$", account_currency="USD"):
     """Common exit handler: close, log, circuit breaker, state cleanup, notify."""
 
-    # ── Step 1: Snapshot balance BEFORE close ──
+    # ── Step 1: Read position UPL BEFORE close (exact Capital.com P&L) ──
+    broker_profit = None
+    try:
+        upl = client.get_position_upl(str(deal_id))
+        if upl is not None:
+            broker_profit = round(upl, 2)
+            log_line(logfile, f"POSITION_UPL_BEFORE_CLOSE: {broker_profit}")
+    except Exception as e:
+        log_line(logfile, f"POSITION_UPL warning: {repr(e)}")
+
+    # ── Step 2: Snapshot balance BEFORE close (backup method) ──
     balance_before = None
     try:
         balance_before = client.get_account_balance()
@@ -460,11 +470,10 @@ def _handle_position_exit(client, st, pos, deal_id, direction, reason, exit_pric
     except Exception as e:
         log_line(logfile, f"BALANCE_BEFORE warning: {repr(e)}")
 
-    # ── Step 2: Close position ──
+    # ── Step 3: Close position ──
     conf = safe_close_position(client, str(deal_id))
 
-    # ── Step 3: Get broker exit price from confirm ──
-    broker_profit = None
+    # ── Step 4: Get broker exit price from confirm ──
     broker_exit_price = None
     try:
         close_ref = (conf or {}).get("dealReference") or (conf or {}).get("deal_reference")
@@ -474,14 +483,15 @@ def _handle_position_exit(client, st, pos, deal_id, direction, reason, exit_pric
             if close_conf:
                 log_line(logfile, f"BROKER_CLOSE_CONFIRM_FULL: {json.dumps(close_conf)[:500]}")
                 if close_conf.get("profit") is not None:
-                    broker_profit = float(close_conf["profit"])
+                    broker_profit = round(float(close_conf["profit"]), 2)
+                    log_line(logfile, f"BROKER_CONFIRM_PROFIT: {broker_profit}")
                 if close_conf.get("level") is not None:
                     broker_exit_price = float(close_conf["level"])
                 log_line(logfile, f"BROKER_CLOSE_CONFIRM: profit={broker_profit} level={broker_exit_price}")
     except Exception as e:
         log_line(logfile, f"BROKER_CLOSE_CONFIRM warning: {repr(e)}")
 
-    # ── Step 4: Snapshot balance AFTER close (most reliable PnL method) ──
+    # ── Step 5: Balance snapshot fallback (if UPL and confirm both failed) ──
     if broker_profit is None and balance_before is not None:
         try:
             time.sleep(1.0)
@@ -492,33 +502,6 @@ def _handle_position_exit(client, st, pos, deal_id, direction, reason, exit_pric
                 log_line(logfile, f"BALANCE_DIFF_PROFIT: {broker_profit} (after={balance_after} - before={balance_before})")
         except Exception as e:
             log_line(logfile, f"BALANCE_AFTER warning: {repr(e)}")
-
-    # ── Step 5: Fallback - transaction history ──
-    if broker_profit is None:
-        try:
-            time.sleep(1.5)
-            history = client.get_history_transactions(max_items=5)
-            log_line(logfile, f"BROKER_TX_HISTORY_FULL: {json.dumps(history)[:800]}")
-            transactions = history.get("transactions") or []
-            for tx in transactions:
-                ref = tx.get("reference") or ""
-                tx_type = (tx.get("type") or tx.get("transactionType") or "").upper()
-                if str(deal_id) in str(ref) or "TRADE" in tx_type:
-                    for field in ("profitAndLoss", "profit", "cashTransaction", "amount", "size"):
-                        val = tx.get(field)
-                        if val is not None:
-                            try:
-                                cleaned = str(val).replace(",", "").replace("€", "").replace("$", "").replace("£", "").strip()
-                                if cleaned and cleaned not in ("-", "0"):
-                                    broker_profit = float(cleaned)
-                                    log_line(logfile, f"BROKER_TX_HISTORY profit ({field}): {broker_profit}")
-                                    break
-                            except (ValueError, TypeError):
-                                pass
-                    if broker_profit is not None:
-                        break
-        except Exception as e:
-            log_line(logfile, f"BROKER_TX_HISTORY warning: {repr(e)}")
 
     try:
         st["last_broker_close"] = {"close_resp": conf}
@@ -1020,40 +1003,51 @@ def run_bot(cfg: Dict[str, Any], once: bool = False):
                     rec_sl = state_pos.get("sl_local")
                     rec_tp = state_pos.get("tp_local")
 
-                    # Try to get the actual exit details from transaction history
+                    # Try to get exit details from activity history
                     rec_profit = None
                     rec_exit_price = 0.0
+                    rec_reason = "EXIT_SL"  # default: assume SL (most common broker-side close)
                     try:
                         time.sleep(0.5)
-                        balance_now = client.get_account_balance()
-                        # Try activity history for the specific deal
-                        history = client.get_history_transactions(max_items=5)
-                        log_line(logfile, f"RECONCILE_TX_HISTORY: {json.dumps(history)[:500]}")
-                        for tx in (history.get("transactions") or []):
-                            ref = str(tx.get("reference") or "")
-                            if str(state_deal) in ref:
-                                for field in ("profitAndLoss", "profit", "cashTransaction", "amount", "size"):
-                                    val = tx.get(field)
-                                    if val is not None:
-                                        try:
-                                            cleaned = str(val).replace(",", "").replace("€", "").replace("$", "").replace("£", "").strip()
-                                            if cleaned and cleaned not in ("-", "0"):
-                                                rec_profit = float(cleaned)
-                                                break
-                                        except (ValueError, TypeError):
-                                            pass
+                        activity = client.get_history_activity(max_items=10)
+                        log_line(logfile, f"RECONCILE_ACTIVITY: {json.dumps(activity)[:500]}")
+                        for act in (activity.get("activities") or []):
+                            act_deal = str((act or {}).get("dealId") or "")
+                            if str(state_deal) in act_deal:
+                                source = str((act or {}).get("source") or "").upper()
+                                if source == "TP":
+                                    rec_reason = "EXIT_TP"
+                                elif source == "SL":
+                                    rec_reason = "EXIT_SL"
+                                log_line(logfile, f"RECONCILE_ACTIVITY_MATCH: dealId={act_deal} source={source}")
                                 break
                     except Exception as e2:
-                        log_line(logfile, f"RECONCILE_TX warning: {repr(e2)}")
-
-                    # Determine exit reason
-                    if rec_profit is not None:
-                        rec_reason = "EXIT_TP" if rec_profit > 0 else "EXIT_SL"
-                    else:
-                        rec_reason = "EXIT_SL"  # assume SL (most common broker-side close)
+                        log_line(logfile, f"RECONCILE_ACTIVITY warning: {repr(e2)}")
 
                     profit_pts = 0.0
-                    profit_cash = rec_profit if rec_profit is not None else 0.0
+                    profit_cash = 0.0
+                    # For broker-closed positions: best guess from SL/TP levels
+                    if rec_reason == "EXIT_SL" and rec_sl is not None and rec_entry > 0:
+                        try:
+                            sl_val = float(rec_sl)
+                            if rec_direction == "BUY":
+                                profit_pts = sl_val - rec_entry
+                            else:
+                                profit_pts = rec_entry - sl_val
+                            profit_cash = round(profit_pts * rec_size, 2)
+                        except (ValueError, TypeError):
+                            pass
+                    elif rec_reason == "EXIT_TP" and rec_tp is not None and rec_entry > 0:
+                        try:
+                            tp_val = float(rec_tp)
+                            if rec_direction == "BUY":
+                                profit_pts = tp_val - rec_entry
+                            else:
+                                profit_pts = rec_entry - tp_val
+                            profit_cash = round(profit_pts * rec_size, 2)
+                        except (ValueError, TypeError):
+                            pass
+                    log_line(logfile, f"RECONCILE_PNL: reason={rec_reason} profit_cash={profit_cash:.2f} (estimated from SL/TP levels)")
 
                     # Log to CSV
                     safe_append_row(csv_path, now.isoformat(), bot_id, epic, rec_direction, rec_size,

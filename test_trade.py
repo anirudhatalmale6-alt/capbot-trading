@@ -145,7 +145,17 @@ def main():
         print(f"  {remaining}s remaining...")
         time.sleep(min(10, remaining))
 
-    # ── BALANCE SNAPSHOT: before close ──
+    # ── Step 1: Read position UPL BEFORE close (exact Capital.com P&L) ──
+    broker_profit = None
+    try:
+        upl = client.get_position_upl(deal_id)
+        if upl is not None:
+            broker_profit = round(upl, 2)
+            print(f"Position UPL (Capital.com P&L): {currency_symbol}{broker_profit}")
+    except Exception as e:
+        print(f"Position UPL warning: {e}")
+
+    # ── Step 2: Snapshot balance BEFORE close (backup) ──
     balance_before = None
     try:
         balance_before = client.get_account_balance()
@@ -170,10 +180,9 @@ def main():
     if still_open:
         print("WARNING: Position may still be open. Check Capital.com.")
     else:
-        # ── Method 1: Confirm endpoint (may not have profit) ──
+        # ── Get broker exit price from confirm ──
         close_deal_ref = (close_resp or {}).get("dealReference")
         exit_price = entry_price
-        broker_profit = None
         if close_deal_ref:
             time.sleep(1)
             close_conf = client.confirm(str(close_deal_ref), timeout_sec=10)
@@ -182,10 +191,10 @@ def main():
                 if close_conf.get("level"):
                     exit_price = float(close_conf["level"])
                 if close_conf.get("profit") is not None:
-                    broker_profit = float(close_conf["profit"])
+                    broker_profit = round(float(close_conf["profit"]), 2)
                     print(f"Broker confirm profit: {broker_profit}")
 
-        # ── Method 2: Balance snapshot (most reliable) ──
+        # ── Fallback: Balance snapshot ──
         if broker_profit is None and balance_before is not None:
             try:
                 time.sleep(1)
@@ -196,33 +205,6 @@ def main():
                     print(f"Balance diff profit: {broker_profit} (after={balance_after} - before={balance_before})")
             except Exception as e:
                 print(f"Balance after warning: {e}")
-
-        # ── Method 3: Transaction history fallback ──
-        if broker_profit is None:
-            try:
-                time.sleep(2)
-                history = client.get_history_transactions(max_items=5)
-                print(f"Transaction history response (FULL): {json.dumps(history)}")
-                transactions = history.get("transactions") or []
-                for tx in transactions:
-                    ref = tx.get("reference") or ""
-                    tx_type = (tx.get("type") or tx.get("transactionType") or "").upper()
-                    if str(deal_id) in str(ref) or "TRADE" in tx_type:
-                        for field in ("profitAndLoss", "profit", "cashTransaction", "amount", "size"):
-                            val = tx.get(field)
-                            if val is not None:
-                                try:
-                                    cleaned = str(val).replace(",", "").replace("€", "").replace("$", "").replace("£", "").strip()
-                                    if cleaned and cleaned not in ("-", "0"):
-                                        broker_profit = float(cleaned)
-                                        print(f"Transaction history profit ({field}): {broker_profit}")
-                                        break
-                                except (ValueError, TypeError):
-                                    pass
-                        if broker_profit is not None:
-                            break
-            except Exception as e:
-                print(f"Transaction history lookup warning: {e}")
 
         if args.direction == "BUY":
             profit_pts = round(exit_price - entry_price, 2)

@@ -255,6 +255,20 @@ class CapitalClient:
             pass
         return None
 
+    def get_position_upl(self, deal_id: str) -> Optional[float]:
+        """Get the unrealized P&L (upl) for an open position. This is the EXACT
+        profit/loss that Capital.com displays on the platform."""
+        try:
+            item = self.get_position_by_deal_id(deal_id)
+            if item:
+                pos = (item or {}).get("position") or {}
+                upl = pos.get("upl")
+                if upl is not None:
+                    return float(upl)
+        except Exception:
+            pass
+        return None
+
     def get_history_activity(self, frm: Optional[str] = None, to: Optional[str] = None, max_items: int = 200) -> Dict[str, Any]:
         """Best-effort: Capital history activity. If endpoint unsupported, returns {}."""
         params = {}
@@ -310,17 +324,31 @@ class CapitalClient:
             return {}
 
     def get_account_balance(self) -> Optional[float]:
-        """Get the current account balance (best-effort). Returns None on failure."""
+        """Get the CURRENT account's balance (best-effort).
+        Uses GET /api/v1/session to get the current account's balance directly,
+        which avoids the problem of picking the wrong sub-account."""
         try:
+            sess = self.get_session()
+            acct_info = sess.get("accountInfo") or {}
+            if "balance" in acct_info:
+                return float(acct_info["balance"])
+        except Exception:
+            pass
+        # Fallback: GET /api/v1/accounts, find current account
+        try:
+            sess = self.get_session()
+            current_id = sess.get("currentAccountId") or sess.get("accountId")
             data = self.get_accounts()
+            for acct in (data.get("accounts") or []):
+                if current_id and str((acct or {}).get("accountId")) == str(current_id):
+                    bal = (acct or {}).get("balance") or {}
+                    if "balance" in bal:
+                        return float(bal["balance"])
+            # Last resort: first account
             for acct in (data.get("accounts") or []):
                 bal = (acct or {}).get("balance") or {}
                 if "balance" in bal:
                     return float(bal["balance"])
-            # Fallback: single-account response
-            bal = data.get("balance") or {}
-            if "balance" in bal:
-                return float(bal["balance"])
         except Exception:
             pass
         return None
