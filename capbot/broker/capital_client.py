@@ -302,6 +302,29 @@ class CapitalClient:
         r = self.request("PUT", f"/api/v1/positions/{deal_id}", data=json.dumps(payload))
         return r.json() if r.text else {}
 
+    def get_accounts(self) -> Dict[str, Any]:
+        """GET /api/v1/accounts — returns account info including balance/profitLoss."""
+        try:
+            return self.request("GET", "/api/v1/accounts", retries=3).json()
+        except Exception:
+            return {}
+
+    def get_account_balance(self) -> Optional[float]:
+        """Get the current account balance (best-effort). Returns None on failure."""
+        try:
+            data = self.get_accounts()
+            for acct in (data.get("accounts") or []):
+                bal = (acct or {}).get("balance") or {}
+                if "balance" in bal:
+                    return float(bal["balance"])
+            # Fallback: single-account response
+            bal = data.get("balance") or {}
+            if "balance" in bal:
+                return float(bal["balance"])
+        except Exception:
+            pass
+        return None
+
     def close_position(self, deal_id: str) -> Dict[str, Any]:
         r = self.request("DELETE", f"/api/v1/positions/{deal_id}")
         return r.json() if r.text else {}

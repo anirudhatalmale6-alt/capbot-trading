@@ -145,6 +145,14 @@ def main():
         print(f"  {remaining}s remaining...")
         time.sleep(min(10, remaining))
 
+    # ── BALANCE SNAPSHOT: before close ──
+    balance_before = None
+    try:
+        balance_before = client.get_account_balance()
+        print(f"Balance BEFORE close: {balance_before}")
+    except Exception as e:
+        print(f"Balance before warning: {e}")
+
     # Close position using the real deal_id from positions
     print(f"\nClosing position {deal_id}...")
     close_resp = client.close_position(deal_id)
@@ -162,7 +170,7 @@ def main():
     if still_open:
         print("WARNING: Position may still be open. Check Capital.com.")
     else:
-        # Get actual close details from confirm
+        # ── Method 1: Confirm endpoint (may not have profit) ──
         close_deal_ref = (close_resp or {}).get("dealReference")
         exit_price = entry_price
         broker_profit = None
@@ -170,31 +178,45 @@ def main():
             time.sleep(1)
             close_conf = client.confirm(str(close_deal_ref), timeout_sec=10)
             if close_conf:
-                print(f"Broker confirm response: {close_conf}")
+                print(f"Broker confirm response (FULL): {json.dumps(close_conf)}")
                 if close_conf.get("level"):
                     exit_price = float(close_conf["level"])
                 if close_conf.get("profit") is not None:
                     broker_profit = float(close_conf["profit"])
                     print(f"Broker confirm profit: {broker_profit}")
 
-        # Fallback: fetch from transaction history if confirm didn't have profit
+        # ── Method 2: Balance snapshot (most reliable) ──
+        if broker_profit is None and balance_before is not None:
+            try:
+                time.sleep(1)
+                balance_after = client.get_account_balance()
+                print(f"Balance AFTER close: {balance_after}")
+                if balance_after is not None:
+                    broker_profit = round(balance_after - balance_before, 2)
+                    print(f"Balance diff profit: {broker_profit} (after={balance_after} - before={balance_before})")
+            except Exception as e:
+                print(f"Balance after warning: {e}")
+
+        # ── Method 3: Transaction history fallback ──
         if broker_profit is None:
             try:
                 time.sleep(2)
                 history = client.get_history_transactions(max_items=5)
+                print(f"Transaction history response (FULL): {json.dumps(history)}")
                 transactions = history.get("transactions") or []
                 for tx in transactions:
                     ref = tx.get("reference") or ""
                     tx_type = (tx.get("type") or tx.get("transactionType") or "").upper()
                     if str(deal_id) in str(ref) or "TRADE" in tx_type:
-                        # Check for profit/cashTransaction/profitAndLoss fields
-                        for field in ("profitAndLoss", "profit", "cashTransaction", "amount"):
+                        for field in ("profitAndLoss", "profit", "cashTransaction", "amount", "size"):
                             val = tx.get(field)
                             if val is not None:
                                 try:
-                                    broker_profit = float(str(val).replace(",", ""))
-                                    print(f"Transaction history profit ({field}): {broker_profit}")
-                                    break
+                                    cleaned = str(val).replace(",", "").replace("€", "").replace("$", "").replace("£", "").strip()
+                                    if cleaned and cleaned not in ("-", "0"):
+                                        broker_profit = float(cleaned)
+                                        print(f"Transaction history profit ({field}): {broker_profit}")
+                                        break
                                 except (ValueError, TypeError):
                                     pass
                         if broker_profit is not None:
@@ -210,9 +232,10 @@ def main():
         # Use broker's actual profit (includes spread + currency conversion) if available
         if broker_profit is not None:
             profit_cash = round(broker_profit, 2)
+            print(f"Using BROKER profit: {currency_symbol}{profit_cash}")
         else:
             profit_cash = round(profit_pts * args.size, 2)
-            print("WARNING: Could not get broker profit, using local calculation")
+            print(f"WARNING: Could not get broker profit, using local calculation: {currency_symbol}{profit_cash}")
 
         print(f"Position closed! Entry={entry_price} Exit={exit_price} PnL={profit_pts}pts {currency_symbol}{profit_cash}")
         close_payload = {
