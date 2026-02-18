@@ -10,7 +10,7 @@ import json
 import signal
 import threading
 
-ENGINE_BUILD_TAG = "20260218_engine_v5"
+ENGINE_BUILD_TAG = "20260218_engine_v6"
 
 # ──────────────────────────────────────────────────
 # Imports
@@ -1531,6 +1531,10 @@ def run_bot(cfg: Dict[str, Any], once: bool = False):
             "exit_bars": exit_bars,
             "broker_snap_open": broker_snap_open,
         }
+        # Skip SL/TP check on the entry candle - only start checking from the NEXT bar.
+        # Without this, the entry candle's low/high (which may have touched SL before our entry)
+        # would trigger an immediate false EXIT_SL on the very first management check.
+        st["last_mgmt_bar_iso"] = _to_utc_ts(entry_time).isoformat()
         save_state(st)
 
         log_line(logfile, f"ENTRY \u2705 deal_id={deal_id} {sig.direction} size={size} entry={entry_price:.2f} SL={sl_local:.2f} TP={tp_local:.2f}")
